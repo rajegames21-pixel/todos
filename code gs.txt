@@ -1,0 +1,4194 @@
+/**
+ * SISTEMA DE GESTÃO E SEPARAÇÃO DE PCI
+ * Backend - Google Apps Script (Code.gs)
+ *
+ * Revisão: correções de concorrência (LockService), busca de linha por ID
+ * (em vez de índice de linha "congelado" no cliente), validação server-side
+ * e geração de ID com menor chance de colisão.
+ *
+ * ⚠️ CONFIGURAÇÃO OBRIGATÓRIA DA IMPLANTAÇÃO (Implantar → Gerenciar implantações):
+ * "Executar como" precisa ser "Eu" (o desenvolvedor/dono do script), NÃO
+ * "Usuário que acessa o app". Em contas Google Workspace (ex: cliptech.com.br),
+ * usar "Usuário que acessa o app" faz o acesso à planilha falhar
+ * silenciosamente para qualquer pessoa que não seja o dono, pois cada usuário
+ * precisaria autorizar o script individualmente — e isso costuma ser
+ * bloqueado por política do administrador do domínio.
+ * Se um dia for necessário enviar e-mails "como" cada usuário (não apenas
+ * como o dono), use MailApp.sendEmail() com replyTo configurado para o
+ * e-mail de quem preencheu o formulário — assim continua funcionando com
+ * "Executar como: Eu" e sem pedir autorização extra a ninguém.
+ */
+
+const NOME_ABA_SOLICITACOES = "Solicitacoes_PCI";
+const NOME_ABA_HISTORICO = "Historico_PCI";
+const NOME_ABA_SUGESTOES = "Sugestoes_Autocomplete";
+const NOME_ABA_EMAILS_EQUIPES = "Emails_Equipes";
+// Aba onde o usuário cadastra o nome completo (nome e sobrenome) de cada
+// e-mail do PCP/IR — usada só pra exibir "Nome Sobrenome" de forma
+// consistente quando o sistema detecta uma resposta, já que o nome que
+// aparece no cabeçalho "De:" do Gmail depende de como cada pessoa configurou
+// o próprio nome de exibição (às vezes só o primeiro nome, ou o e-mail cru).
+const NOME_ABA_NOMES_CONTATOS = "Nomes_Contatos";
+
+// URL da implantação de Web App com LOGIN OBRIGATÓRIO (deploy separado do
+// principal, mesmo projeto) — usada SÓ no botão de confirmação do e-mail
+// (montarBotaoConfirmacaoAviso_), pra dar pra identificar automaticamente
+// quem clicou (Session.getActiveUser()) sem exigir login no sistema inteiro.
+// Preencher depois de criar essa segunda implantação (Implantar > Nova
+// implantação > Tipo: App da Web > "Quem tem acesso": Qualquer pessoa com
+// uma Conta do Google, ou "Qualquer pessoa em cliptech.com.br" se essa opção
+// aparecer). Enquanto estiver vazia, o botão usa a URL normal (sem login) e
+// pede o nome manualmente, como já fazia antes.
+const URL_WEBAPP_COM_LOGIN = "";
+
+// Liga/desliga o botão verde "Confirmar" nos e-mails de Sem Requisição /
+// Em Depósito Qualidade (ver montarBotaoConfirmacaoAviso_). Desativado por
+// enquanto — com o texto da resposta já aparecendo direto na timeline, sem
+// precisar clicar em nada, o botão ficou redundante por ora. Muda pra true
+// se decidir voltar a usar depois.
+const BOTAO_CONFIRMACAO_ATIVO = false;
+// Classificação de cada item da solicitação — gravada por ITEM (não fixa
+// direto na aba de sugestões). Na prática, o front-end trava o campo Tipo
+// automaticamente pro valor já cadastrado quando o código é conhecido; só
+// permite escolher quando o código é novo (ainda não cadastrado).
+const TIPOS_ITEM_VALIDOS = ["PCI", "PASTA DE SOLDA", "SMD", "ADESIVO"];
+
+// ID da planilha de destino. Usado como referência garantida caso o script
+// não esteja vinculado (bound) diretamente à planilha — o que faz
+// SpreadsheetApp.getActiveSpreadsheet() retornar null.
+const ID_PLANILHA = "1DJMHqKCOyWOl7eRLaqbxccdHGseQJtusSh5etkCtmIk";
+
+// Planilha do sistema separado "Requisição Manual" — usado pra itens "sem
+// requisição" (materiais que não seguem o fluxo normal de fila de separação
+// do PCI/PASTA/SMD). Gravamos direto na aba "lista" de lá, no mesmo formato
+// que o próprio Requisição Manual usa (função salvarEntrega do Code.gs dele),
+// pra eliminar o passo manual de alguém digitar de novo num sistema separado.
+const PLANILHA_REQUISICAO_MANUAL_URL = "https://docs.google.com/spreadsheets/d/1vFMBO8S0Af2cgE2mLnmJD0CwryaCJZRa1YVnqpmboTM/edit?gid=0#gid=0";
+const ABA_REQUISICAO_MANUAL = "lista";
+
+// Prefixo usado no nome de cada arquivo (foto/assinatura) salvo no Drive
+// pelo sistema — ver PREFIXO_ARQUIVO_ENTREGA_DRIVE logo abaixo e o comentário
+// de salvarImagemBase64NoDrive_() pra entender por que NÃO existe mais uma
+// pasta dedicada pra esses arquivos.
+const PREFIXO_ARQUIVO_ENTREGA_DRIVE = "PCI - Entrega";
+
+// ---------- "QUEM ESTÁ PROCESSANDO AGORA" (mensagem de sistema ocupado) ----------
+// O LockService do Apps Script já impede duas pessoas mexerem na planilha ao
+// mesmo tempo (evita corromper dados), mas por padrão só diz "sistema
+// ocupado" sem dizer QUEM está segurando o lock. Esses helpers guardam nas
+// Propriedades do Script quem está processando o quê, pra poder avisar quem
+// esbarrar no lock — ex: "MARIA está processando uma baixa de separação
+// agora (começou há 4s)" em vez de só "tente novamente".
+// Uso: chamar registrarProcessamentoEmAndamento_(rotulo, responsavel) logo
+// depois de tryLock() ter sucesso, e limparProcessamentoEmAndamento_() no
+// finally (mesmo bloco que dá lock.releaseLock()). Quando tryLock() falhar,
+// usar mensagemSistemaOcupado_(rotuloPadrao) no throw.
+function registrarProcessamentoEmAndamento_(rotulo, responsavel) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(
+      "PROCESSAMENTO_EM_ANDAMENTO",
+      JSON.stringify({ rotulo: rotulo || "uma operação", responsavel: String(responsavel || "").trim() || "outro usuário", desde: new Date().getTime() })
+    );
+  } catch (e) {
+    // Não crítico — na pior das hipóteses a mensagem de ocupado fica genérica.
+  }
+}
+
+function limparProcessamentoEmAndamento_() {
+  try {
+    PropertiesService.getScriptProperties().deleteProperty("PROCESSAMENTO_EM_ANDAMENTO");
+  } catch (e) {
+    // Não crítico.
+  }
+}
+
+function mensagemSistemaOcupado_(rotuloPadrao) {
+  try {
+    const bruto = PropertiesService.getScriptProperties().getProperty("PROCESSAMENTO_EM_ANDAMENTO");
+    if (bruto) {
+      const info = JSON.parse(bruto);
+      const segundosAtras = Math.max(0, Math.round((new Date().getTime() - (info.desde || 0)) / 1000));
+      const quando = segundosAtras < 60 ? `há ${segundosAtras}s` : `há ${Math.round(segundosAtras / 60)}min`;
+      return `O sistema está ocupado — ${info.responsavel} está processando ${info.rotulo} agora (começou ${quando}). Tente novamente em instantes.`;
+    }
+  } catch (e) {
+    // Cai no padrão abaixo.
+  }
+  return `O sistema está ocupado processando ${rotuloPadrao || "outra operação"}. Tente novamente em instantes.`;
+}
+
+// ---------- LIMITADOR DE FREQUÊNCIA (evita repetir trabalho caro toda vez) ----------
+// Roda `fn` de verdade no máximo 1 vez a cada `intervaloSegundos`, usando o
+// Cache do Script pra lembrar "já rodei recentemente" — chamadas repetidas
+// dentro dessa janela são puladas silenciosamente (sem erro, sem lock, sem
+// custo nenhum). Usado em carregarDadosSistema_() pra não repetir checagens
+// caras (Gmail, outra planilha) a cada 25s de polling. Se o Cache falhar por
+// qualquer motivo (raro), roda `fn` mesmo assim — mais seguro que travar
+// silenciosamente pra sempre.
+function executarComLimiteDeFrequencia_(chaveCache, intervaloSegundos, fn) {
+  try {
+    const cache = CacheService.getScriptCache();
+    if (cache.get(chaveCache)) return; // já rodou recentemente, pula
+    cache.put(chaveCache, "1", intervaloSegundos);
+  } catch (e) {
+    // Cache indisponível — roda mesmo assim, sem o limitador.
+  }
+  fn();
+}
+
+// ---------- LEITURA DO HISTÓRICO (com limite opcional, pra carregamento rápido) ----------
+// Extraída de carregarDadosSistema_() pra poder ser reaproveitada tanto no
+// carregamento rápido inicial (só as baixas mais recentes) quanto no
+// carregamento completo em segundo plano (carregarHistoricoCompleto()).
+// `limiteLinhas`: se informado, lê só as ÚLTIMAS N linhas de dados da aba
+// (as mais recentes, já que tudo é gravado com appendRow — nunca inserido no
+// meio) em vez da aba inteira. É esse limite que faz a diferença de
+// performance: pular a leitura/decodificação do JSON de baixas antigas que
+// ninguém vai olhar no carregamento inicial.
+// Retorna { historicoMapa: Map, totalLinhasFinalizadas, foiTruncado }.
+function lerHistoricoDaAba_(abaHist, limiteLinhas) {
+  const totalLinhasDados = Math.max(0, abaHist.getLastRow() - 1); // sem contar cabeçalho
+  const historicoMapa = new Map();
+
+  if (totalLinhasDados === 0) {
+    return { historicoMapa: historicoMapa, totalLinhasFinalizadas: 0, foiTruncado: false };
+  }
+
+  const foiTruncado = !!limiteLinhas && totalLinhasDados > limiteLinhas;
+  const numLinhasParaLer = foiTruncado ? limiteLinhas : totalLinhasDados;
+  const linhaInicial = 2 + (totalLinhasDados - numLinhasParaLer); // 2 = primeira linha de dados (linha 1 é cabeçalho)
+
+  const dadosHist = abaHist.getRange(linhaInicial, 1, numLinhasParaLer, 15).getValues();
+
+  for (let i = 0; i < dadosHist.length; i++) {
+    const id = String(dadosHist[i][0] || "").trim();
+    if (!id) continue;
+    const itemHist = {
+      id: id,
+      pcp: dadosHist[i][1],
+      logistica: dadosHist[i][2],
+      dataCriacao: formatarDataCelula(dadosHist[i][3]),
+      dataFinalizacao: formatarDataCelula(dadosHist[i][4]),
+      tempoMinutos: dadosHist[i][5],
+      tempoFormatado: dadosHist[i][6],
+      itens: JSON.parse(dadosHist[i][7] || "[]"),
+      detalhes: JSON.parse(dadosHist[i][8] || "[]"),
+      linhaProducao: dadosHist[i][9] || "",
+      urgente: dadosHist[i][10] === "SIM",
+      separacaoIniciadaPor: dadosHist[i][11] || "",
+      separacaoIniciadaEm: formatarDataCelula(dadosHist[i][12] || ""),
+      cliente: dadosHist[i][13] || "",
+      setor: dadosHist[i][14] || "LOGISTICA",
+      emAndamento: false
+    };
+
+    // Se já existir uma entrada com o mesmo ID no histórico (proteção contra duplicatas),
+    // mantém a que tiver a data de movimentação/finalização mais recente e mescla detalhes
+    if (historicoMapa.has(id)) {
+      const existente = historicoMapa.get(id);
+      const dataExistente = parseDataBR(existente.dataFinalizacao);
+      const dataNova = parseDataBR(itemHist.dataFinalizacao);
+      if (dataNova >= dataExistente) {
+        const todosDetalhes = (existente.detalhes || []).concat(itemHist.detalhes || []);
+        const detalhesUnicos = [];
+        const chavesVistas = new Set();
+        todosDetalhes.forEach(d => {
+          const k = `${d.dataHora}|${d.tipoNota || ''}|${d.responsavel || ''}`;
+          if (!chavesVistas.has(k)) {
+            chavesVistas.add(k);
+            detalhesUnicos.push(d);
+          }
+        });
+        itemHist.detalhes = detalhesUnicos;
+        historicoMapa.set(id, itemHist);
+      }
+    } else {
+      historicoMapa.set(id, itemHist);
+    }
+  }
+
+  return { historicoMapa: historicoMapa, totalLinhasFinalizadas: totalLinhasDados, foiTruncado: foiTruncado };
+}
+
+// Monta o resultado completo (pendentes + histórico) — usado tanto por
+// carregarDadosSistema_() (rápido, histórico limitado) quanto por
+// carregarHistoricoCompleto() (histórico completo, chamado em segundo plano).
+function montarResultadoCarregamento_(ss, limiteLinhasHistorico) {
+  // Carregar Pendentes
+  const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+  const dadosSol = abaSol.getDataRange().getValues();
+  const pendentes = [];
+
+  for (let i = 1; i < dadosSol.length; i++) {
+    if (dadosSol[i][4] === "PENDENTE" || dadosSol[i][4] === "PARCIAL") {
+      pendentes.push({
+        linha: i + 1, // usado apenas como dica; o backend revalida pelo ID antes de gravar
+        id: dadosSol[i][0],
+        pcp: dadosSol[i][1],
+        logistica: dadosSol[i][2],
+        dataHora: formatarDataCelula(dadosSol[i][3]),
+        status: dadosSol[i][4],
+        itens: JSON.parse(dadosSol[i][5] || "[]"),
+        historicoParcial: JSON.parse(dadosSol[i][6] || "[]"),
+        separacaoIniciadaPor: dadosSol[i][7] || "",
+        separacaoIniciadaEm: formatarDataCelula(dadosSol[i][8] || ""),
+        linhaProducao: dadosSol[i][9] || "",
+        urgente: dadosSol[i][10] === "SIM",
+        cliente: dadosSol[i][11] || "",
+        // Solicitações antigas (de antes desse campo existir) ficam sem
+        // Setor gravado — assume LOGISTICA, já que era o único setor que
+        // existia até então.
+        setor: dadosSol[i][12] || "LOGISTICA"
+      });
+    }
+  }
+
+  // Carregar Histórico (rápido = só as últimas N; completo = tudo)
+  const abaHist = ss.getSheetByName(NOME_ABA_HISTORICO);
+  const leituraHist = lerHistoricoDaAba_(abaHist, limiteLinhasHistorico);
+  const historicoMapa = leituraHist.historicoMapa;
+
+  // Adiciona solicitações em andamento (pendentes que já tiveram alguma baixa parcial ou nota/movimentação)
+  // IMPORTANTE: Cada solicitação gera EXATAMENTE UMA linha no histórico, com o mesmo número de solicitação.
+  // A data de movimentação reflete o último evento ocorrido, fazendo a solicitação subir para o topo do histórico.
+  pendentes.forEach(sol => {
+    const id = String(sol.id || "").trim();
+    if (!id) return;
+    // Se a solicitação já consta como finalizada no histórico, não sobrepõe como em andamento
+    if (historicoMapa.has(id)) return;
+
+    const eventosSol = sol.historicoParcial || [];
+    // Só inclui no histórico se já teve alguma movimentação (baixa parcial, nota, alteração, etc.)
+    if (eventosSol.length === 0 && !sol.separacaoIniciadaPor) return;
+
+    // A data de movimentação mais recente da solicitação
+    let dataUltimaMovimentacao = sol.dataHora;
+    if (eventosSol.length > 0) {
+      const ultimoEvento = eventosSol[eventosSol.length - 1];
+      if (ultimoEvento && ultimoEvento.dataHora) {
+        dataUltimaMovimentacao = ultimoEvento.dataHora;
+      }
+    } else if (sol.separacaoIniciadaEm) {
+      dataUltimaMovimentacao = sol.separacaoIniciadaEm;
+    }
+
+    const duracao = calcularDuracaoFormatada(sol.dataHora, dataUltimaMovimentacao);
+
+    const entrada = {
+      id: sol.id,
+      idExibicao: sol.id,
+      pcp: sol.pcp,
+      logistica: sol.logistica,
+      dataCriacao: sol.dataHora,
+      dataFinalizacao: dataUltimaMovimentacao,
+      tempoMinutos: duracao.minutos,
+      tempoFormatado: duracao.formatado,
+      itens: sol.itens || [],
+      itensOriginais: sol.itens || [],
+      detalhes: eventosSol,
+      linhaProducao: sol.linhaProducao || "",
+      urgente: !!sol.urgente,
+      cliente: sol.cliente || "",
+      separacaoIniciadaPor: sol.separacaoIniciadaPor || "",
+      separacaoIniciadaEm: sol.separacaoIniciadaEm || "",
+      setor: sol.setor || "LOGISTICA",
+      emAndamento: true
+    };
+
+    historicoMapa.set(id, entrada);
+  });
+
+  const historicoCompleto = Array.from(historicoMapa.values()).sort((a, b) => {
+    return parseDataBR(b.dataFinalizacao) - parseDataBR(a.dataFinalizacao);
+  });
+
+  return {
+    pendentes: pendentes,
+    historico: historicoCompleto,
+    historicoTruncado: leituraHist.foiTruncado,
+    totalHistoricoFinalizado: leituraHist.totalLinhasFinalizadas
+  };
+}
+
+/**
+ * Chamada em segundo plano pelo front-end, só depois que a tela já carregou
+ * rápido com o histórico limitado (ver montarResultadoCarregamento_ e o
+ * comentário em carregarDadosSistema_ sobre isso) — busca o histórico
+ * COMPLETO (sem limite de linhas) pra completar silenciosamente a aba
+ * "4. Histórico de Baixas", sem travar nem atrasar o carregamento inicial.
+ * Retorna só a lista de histórico (não repete "pendentes", que o front-end
+ * já tem do carregamento inicial).
+ */
+function carregarHistoricoCompleto() {
+  try {
+    const ss = getPlanilha();
+    const resultado = montarResultadoCarregamento_(ss, null);
+    return JSON.stringify({ historico: resultado.historico });
+  } catch (e) {
+    throw new Error("Falha ao carregar histórico completo: " + (e && e.message ? e.message : e));
+  }
+}
+
+/**
+ * Retorna a planilha correta independente do script estar vinculado
+ * (bound) ou avulso (standalone).
+ */
+function getPlanilha() {
+  const ativa = SpreadsheetApp.getActiveSpreadsheet();
+  if (ativa) return ativa;
+  return SpreadsheetApp.openById(ID_PLANILHA);
+}
+
+/**
+ * DIAGNÓSTICO / FIX do erro de permissão do Drive ("Você não tem permissão
+ * para chamar DriveApp.getFolderById" / "DriveApp.createFolder" /
+ * "DriveApp.createFile") na tela de Finalizar Separação (foto/assinatura).
+ *
+ * HISTÓRICO DO PROBLEMA (26/08/2026), pra não repetir os erros anteriores —
+ * 3 tentativas que NÃO funcionaram, todas usando o serviço simples `DriveApp`:
+ * 1ª: pasta criada MANUALMENTE + `DriveApp.getFolderById()` com escopo
+ *     restrito "drive.file" → falha, "drive.file" só enxerga recursos que o
+ *     PRÓPRIO script criou.
+ * 2ª: o script criar a pasta sozinho, `DriveApp.createFolder()` → falha
+ *     também, o Google exige o escopo amplo "drive" até pra CRIAR pasta.
+ * 3ª: `DriveApp.createFile()` direto na raiz, sem pasta nenhuma → falha
+ *     igual — **o serviço simples `DriveApp` inteiro sempre exige o escopo
+ *     amplo "https://www.googleapis.com/auth/drive" pra praticamente
+ *     qualquer operação, não importa o que esteja declarado no
+ *     appsscript.json**. Só existe uma forma de trabalhar com o escopo
+ *     restrito "drive.file" no Apps Script: usando o SERVIÇO AVANÇADO do
+ *     Drive (Drive API v3, objeto `Drive` em vez de `DriveApp`), que fala
+ *     direto com a API REST do Google respeitando o escopo declarado.
+ * SOLUÇÃO DEFINITIVA (a que ficou): tudo que mexe em Drive agora usa o
+ * Serviço Avançado `Drive` (`Drive.Files.create`, `Drive.Permissions.create`,
+ * `Drive.Files.get`) em vez de `DriveApp`. Isso SIM funciona só com
+ * "drive.file", sem precisar do escopo amplo bloqueado pelo admin do
+ * Workspace da empresa.
+ * REQUISITO NO EDITOR (não dá pra fazer só editando Code.gs — é
+ * configuração do projeto): em Extensões > Apps Script, no menu lateral
+ * "Serviços" (ícone de +), adicionar o serviço "Drive API" (Advanced Drive
+ * Service), versão v3, identificador "Drive". O appsscript.json já enviado
+ * junto já declara isso em "enabledAdvancedServices" — se você colar esse
+ * appsscript.json (com o editor de manifesto ativado nas configurações do
+ * projeto), o serviço já vem habilitado automaticamente, sem precisar
+ * adicionar na mão.
+ *
+ * Rode esta função MANUALMENTE pelo editor de Apps Script (não pela
+ * planilha nem pelo Web App): abra Extensões > Apps Script, selecione
+ * "testarAcessoPastaEntregasDrive" no menu de funções ao lado do botão
+ * "Executar" (▶), e clique em Executar.
+ *
+ * Na primeira vez isso vai abrir uma tela pedindo autorização — escolha a
+ * conta, e se aparecer o aviso "O Google não verificou este app", clique em
+ * "Avançado" e depois em "Acessar [nome do projeto] (não seguro)" — é
+ * esperado pra um script interno da empresa. A permissão pedida agora é
+ * bem mais restrita ("Ver, editar, criar e excluir apenas arquivos do
+ * Google Drive específicos que você usa com este app") — não é o escopo
+ * amplo que a política do Workspace bloqueava antes.
+ *
+ * IMPORTANTE — depois de autorizar, o Web App publicado (o que os usuários
+ * realmente usam no navegador/tablet) SÓ passa a valer com a permissão
+ * nova depois de uma implantação NOVA: vá em Implantar > Gerenciar
+ * implantações > clique no lápis (editar) na implantação ativa > em
+ * "Versão" escolha "Nova versão" > Implantar. Sem esse passo, rodar esta
+ * função só resolve pra quem autorizou, não pro Web App em geral.
+ */
+function testarAcessoPastaEntregasDrive() {
+  const blobTeste = Utilities.newBlob("teste de acesso ao Drive - pode apagar", "text/plain", "PCI - teste de permissao.txt");
+  const arquivoTeste = Drive.Files.create({ name: "PCI - teste de permissao.txt" }, blobTeste);
+  const id = arquivoTeste.id;
+  const mensagem = "OK! Consegui criar um arquivo de teste no Drive (ID: " + id + ", nome \"PCI - teste de permissao.txt\", " +
+    "salvo na raiz do Drive de quem executou este teste) usando o Serviço Avançado do Drive, com o escopo restrito " +
+    "drive.file. Pode apagar esse arquivo de teste manualmente, sem problema.\n\n" +
+    "Se o erro ainda aparecer pros usuários no Web App, falta publicar uma " +
+    "implantação NOVA (Implantar > Gerenciar implantações > editar > Nova " +
+    "versão > Implantar) — a autorização que você acabou de dar só vale pro " +
+    "Web App depois desse passo.";
+  try {
+    SpreadsheetApp.getUi().alert(mensagem);
+  } catch (e) {
+    Logger.log(mensagem);
+  }
+  return mensagem;
+}
+
+/**
+ * Salva uma imagem recebida como Data URL (ex: "data:image/png;base64,AAAA...",
+ * vindo de um <input type=file> ou de canvas.toDataURL()) no Drive, e
+ * retorna uma URL pronta pra usar num <img src="...">.
+ * Usa o SERVIÇO AVANÇADO do Drive (`Drive.Files.create` / Drive API v3), não
+ * o `DriveApp` simples — ver comentário de testarAcessoPastaEntregasDrive()
+ * acima pro motivo (só assim funciona com o escopo restrito "drive.file").
+ * O arquivo é criado direto na raiz do Drive de quem publicou o Web App,
+ * com nome prefixado "PCI - Entrega" pra dar pra achar fácil com uma busca
+ * no Drive.
+ * Lança erro se o dataUrl vier vazio/malformado.
+ */
+function salvarImagemBase64NoDrive_(dataUrl, nomeArquivoBase) {
+  if (!dataUrl || typeof dataUrl !== "string" || dataUrl.indexOf("base64,") === -1) {
+    throw new Error("Imagem inválida recebida para upload (" + nomeArquivoBase + ").");
+  }
+  const partes = dataUrl.split("base64,");
+  const cabecalho = partes[0]; // ex: "data:image/png;"
+  const base64 = partes[1];
+  let mimeType = "image/jpeg";
+  const matchMime = cabecalho.match(/data:([^;]+);/);
+  if (matchMime && matchMime[1]) mimeType = matchMime[1];
+  const extensao = mimeType.indexOf("png") !== -1 ? "png" : (mimeType.indexOf("webp") !== -1 ? "webp" : "jpg");
+
+  const bytes = Utilities.base64Decode(base64);
+  const nomeArquivo = `${PREFIXO_ARQUIVO_ENTREGA_DRIVE} - ${nomeArquivoBase}.${extensao}`;
+  const blob = Utilities.newBlob(bytes, mimeType, nomeArquivo);
+
+  let idArquivo;
+  try {
+    const arquivoCriado = Drive.Files.create({ name: nomeArquivo, mimeType: mimeType }, blob);
+    idArquivo = arquivoCriado.id;
+  } catch (e) {
+    const msgOriginal = String((e && e.message) || e);
+    throw new Error(
+      "Não consegui salvar a imagem no Drive. Peça pro administrador do sistema (RJ) rodar a função " +
+      "testarAcessoPastaEntregasDrive() pelo editor do Apps Script (Extensões > Apps Script) pra " +
+      "autorizar o acesso ao Drive, e em seguida publicar uma NOVA implantação (Implantar > Gerenciar " +
+      "implantações > editar > Nova versão). Detalhe técnico original: " + msgOriginal
+    );
+  }
+  try {
+    Drive.Permissions.create({ role: "reader", type: "anyone" }, idArquivo);
+  } catch (e) {
+    try {
+      Drive.Permissions.create({ role: "reader", type: "domain", domain: "cliptech.com.br" }, idArquivo);
+    } catch (e2) {
+      // Se a política do domínio bloquear compartilhamento externo/domínio,
+      // o arquivo continua salvo e acessível via backend (obterImagemMidiaBase64).
+    }
+  }
+  return "https://drive.google.com/thumbnail?id=" + idArquivo + "&sz=w1200";
+}
+
+/**
+ * Endpoint chamado pelo front-end assim que a foto (ou a assinatura) da
+ * entrega fica pronta — ainda DURANTE o wizard, antes do usuário clicar em
+ * "Finalizar Separação" — pra já subir a imagem pro Drive em segundo plano.
+ * Se isso funcionar, o envio final (processarBaixaSeparacao_) recebe só a
+ * URL pronta em vez da imagem inteira em base64, então não precisa subir
+ * nada de novo — o clique em "Finalizar" fica praticamente instantâneo
+ * (só grava a planilha), em vez de ter que esperar o upload de foto E
+ * assinatura no mesmo clique. Não mexe em planilha nem em lock nenhum, só
+ * sobe o arquivo — por isso é seguro rodar em paralelo com qualquer outra
+ * coisa acontecendo no sistema.
+ * Se der erro aqui (rede ruim, etc.), o front-end simplesmente ignora e
+ * manda a imagem em base64 do jeito antigo no envio final — este endpoint
+ * é só uma otimização, nunca um requisito.
+ */
+function uploadarImagemEntregaAntecipada(dataUrl, idSolicitacao, tipo) {
+  try {
+    const idBase = String(idSolicitacao || "entrega").replace(/[^a-zA-Z0-9\-]/g, "");
+    const carimbo = Utilities.formatDate(new Date(), getFusoHorario(), "yyyyMMdd-HHmmss");
+    const sufixo = tipo === "assinatura" ? "assinatura" : "foto";
+    const url = salvarImagemBase64NoDrive_(dataUrl, `${idBase}_${sufixo}_${carimbo}`);
+    return { sucesso: true, url: url };
+  } catch (e) {
+    return { sucesso: false, erro: String((e && e.message) || e) };
+  }
+}
+
+/**
+ * Extrai o ID de um arquivo do Google Drive a partir de qualquer formato de link:
+ * - https://lh3.googleusercontent.com/d/FILE_ID
+ * - https://drive.google.com/thumbnail?id=FILE_ID...
+ * - https://drive.google.com/file/d/FILE_ID/view...
+ * - https://drive.google.com/uc?id=FILE_ID...
+ * - https://drive.google.com/open?id=FILE_ID...
+ * - ou o próprio ID direto.
+ */
+function extrairIdArquivoDrive_(urlOuId) {
+  if (!urlOuId || typeof urlOuId !== "string") return "";
+  const str = urlOuId.trim();
+  if (/^[a-zA-Z0-9_-]{25,}$/.test(str)) return str;
+  let m = str.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if (m && m[1]) return m[1];
+  m = str.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  if (m && m[1]) return m[1];
+  m = str.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+  if (m && m[1]) return m[1];
+  return "";
+}
+
+/**
+ * Obtém os dados de imagem em formato Base64 diretamente do Drive pelo ID/URL.
+ * Permite exibir a foto/assinatura no modal do Web App com 100% de confiabilidade,
+ * mesmo em contas Workspace onde o compartilhamento público para a internet é bloqueado
+ * ou onde cookies de terceiros impedem o carregamento via tag <img src="https://lh3...">.
+ * Usa o SERVIÇO AVANÇADO do Drive (Drive.Files.get), não DriveApp — compatível
+ * com o escopo restrito "drive.file" (ver comentário de
+ * testarAcessoPastaEntregasDrive() no topo do arquivo).
+ */
+function obterImagemMidiaBase64(urlOuId) {
+  try {
+    const fileId = extrairIdArquivoDrive_(urlOuId);
+    if (!fileId) {
+      return { sucesso: false, erro: "ID do arquivo no Google Drive não foi identificado." };
+    }
+    const metadados = Drive.Files.get(fileId, { fields: "name, mimeType" });
+    const blob = Drive.Files.get(fileId, { alt: "media" });
+    let mimeType = metadados.mimeType || "image/png";
+    if (mimeType.indexOf("image/") !== 0) {
+      mimeType = "image/png";
+    }
+    const base64 = Utilities.base64Encode(blob.getBytes());
+    return {
+      sucesso: true,
+      dataUrl: `data:${mimeType};base64,${base64}`,
+      fileId: fileId,
+      nome: metadados.name
+    };
+  } catch (e) {
+    return { sucesso: false, erro: e.toString() };
+  }
+}
+
+/**
+ * Menu customizado na planilha (só aparece se este script estiver VINCULADO
+ * à planilha — Extensões > Apps Script a partir da própria planilha. Se o
+ * script for avulso/standalone, essa função nunca dispara sozinha; nesse
+ * caso, rode "configurarValidacaoTipoSugestoes" manualmente pelo editor de
+ * Apps Script: seleciona a função no menu de cima e clica em "Executar".
+ */
+function onOpen() {
+  try {
+    SpreadsheetApp.getUi()
+      .createMenu("🔧 Ferramentas PCI")
+      .addItem("Configurar lista (dropdown) na coluna Tipo", "configurarValidacaoTipoSugestoes")
+      .addItem("Ativar verificação automática de respostas (Gmail)", "configurarVerificacaoRespostasAvisos")
+      .addItem("🧹 Limpar respostas antigas (rodar uma vez)", "limparRespostasAntigasArmazenadas_")
+      .addItem("🛠️ Testar acesso à pasta de fotos/assinaturas (Drive)", "testarAcessoPastaEntregasDrive")
+      .addToUi();
+  } catch (e) {
+    // Sem UI disponível (execução fora do contexto da planilha) — ignora.
+  }
+}
+
+/**
+ * Adiciona uma lista suspensa (PCI / PASTA DE SOLDA / SMD / ADESIVO) na coluna Tipo
+ * (coluna C) da aba Sugestoes_Autocomplete, pra preencher manualmente os
+ * códigos antigos ficar rápido — clica na célula e escolhe, em vez de
+ * digitar. Roda uma vez só; pode rodar de novo depois sem problema (só
+ * reaplica a mesma validação).
+ */
+function configurarValidacaoTipoSugestoes() {
+  iniciarPlanilha();
+  const ss = getPlanilha();
+  const aba = ss.getSheetByName(NOME_ABA_SUGESTOES);
+  const ultimaLinha = Math.max(aba.getLastRow(), 200); // deixa espaço pra linhas futuras também
+
+  const regra = SpreadsheetApp.newDataValidation()
+    .requireValueInList(TIPOS_ITEM_VALIDOS, true)
+    .setAllowInvalid(false)
+    .build();
+
+  aba.getRange(2, 3, ultimaLinha - 1, 1).setDataValidation(regra);
+
+  try {
+    SpreadsheetApp.getUi().alert("Pronto! A coluna Tipo (C) agora tem uma lista suspensa com PCI / PASTA DE SOLDA / SMD / ADESIVO, da linha 2 até a " + ultimaLinha + ".");
+  } catch (e) {
+    // Rodando fora da UI (ex: direto no editor de Apps Script) — sem alerta, sem problema.
+  }
+}
+
+/**
+ * Retorna o fuso horário. Calculado sob demanda (nunca no nível superior do
+ * arquivo) para não depender do contexto de execução em que o script é carregado.
+ */
+function getFusoHorario() {
+  try {
+    return getPlanilha().getSpreadsheetTimeZone();
+  } catch (e) {
+    return Session.getScriptTimeZone();
+  }
+}
+
+// Tira o prefixo "PCI-" do ID pra exibição (nos e-mails, mensagens etc.) —
+// mesma ideia da função numeroExibicao() do front-end.
+function numeroExibicaoId_(id) {
+  return String(id || "").replace("PCI-", "");
+}
+
+// ---------- AVISOS POR E-MAIL (Sem Requisição / Sem Estoque / Em Depósito Qualidade) ----------
+// Só o ADM da Logística consegue disparar esses avisos (checado no
+// front-end antes de chamar essas funções, mas cada uma também confere de
+// novo aqui, já que qualquer chamada de google.script.run pode ser feita
+// direto, sem passar pela tela).
+
+// Busca o(s) e-mail(s) de uma equipe na aba Emails_Equipes — cada COLUNA é o
+// nome de um time (cabeçalho na linha 1: SMT, PCP, IR), e os e-mails desse
+// time ficam listados um por linha, embaixo do cabeçalho — pode adicionar
+// quantas linhas precisar. Junta os que estiverem preenchidos com vírgula só
+// na hora de montar o destinatário do MailApp. Retorna null se a coluna não
+// existir ou nenhum e-mail estiver preenchido.
+function obterEmailEquipe_(equipe) {
+  const ss = getPlanilha();
+  const aba = ss.getSheetByName(NOME_ABA_EMAILS_EQUIPES);
+  if (!aba || aba.getLastRow() < 1 || aba.getLastColumn() < 1) return null;
+
+  const cabecalho = aba.getRange(1, 1, 1, aba.getLastColumn()).getValues()[0];
+  let colunaEquipe = -1;
+  for (let c = 0; c < cabecalho.length; c++) {
+    if (String(cabecalho[c]).trim().toUpperCase() === String(equipe).trim().toUpperCase()) {
+      colunaEquipe = c + 1; // getRange é 1-based
+      break;
+    }
+  }
+  if (colunaEquipe === -1) return null;
+  if (aba.getLastRow() < 2) return null;
+
+  const valores = aba.getRange(2, colunaEquipe, aba.getLastRow() - 1, 1).getValues();
+  const emails = valores
+    .map(linha => String(linha[0] || "").trim())
+    .filter(Boolean);
+  return emails.length > 0 ? emails.join(",") : null;
+}
+
+// ESTILO PADRÃO dos e-mails de aviso (Sem Requisição, Em Depósito Qualidade e
+// qualquer outro que vier depois) — visual limpo (parágrafos, sem
+// tabelas/caixas), com um leve destaque em gradiente atrás dos títulos.
+// Recebe só os textos que mudam de um aviso pro outro; o resto (saudação por
+// horário, dados da solicitação, avisos de urgência, assinatura) é sempre
+// igual.
+function montarCorpoHtmlAvisoEquipe_(opts) {
+  const tituloAmarelo = "display:inline-block;background:linear-gradient(135deg,#fef9c3,#fde68a);padding:4px 8px;border-radius:4px;";
+  const tituloVerde = "display:inline-block;background:linear-gradient(135deg,#d1fae5,#a7f3d0);color:#065f46;padding:4px 8px;border-radius:4px;";
+  const tituloVermelho = "display:inline-block;background:linear-gradient(135deg,#fecaca,#fca5a5);color:#7f1d1d;padding:4px 8px;border-radius:4px;";
+  const dadosSol = opts.dadosSol, item = opts.item;
+
+  return `
+  <div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#1f2937;max-width:640px;">
+    <p>${saudacaoPorHorario_()},<br>${opts.nomeTime}</p>
+
+    <p><strong style="${tituloAmarelo}">${opts.tituloRegistro}</strong></p>
+
+    <p>
+      <strong>Solicitação - Data/Hora:</strong> ${dadosSol.dataCriacaoSolicitacao || "-"}<br>
+      <strong>Registro Pendência - Data/Hora:</strong> ${dadosSol.dataHoraRegistro}<br>
+      <strong>Solicitação Nº:</strong> ${dadosSol.id}<br>
+      <strong>Tipo Material:</strong> ${item.tipo}<br>
+      <strong>Cód. Material:</strong> ${item.codigo}<br>
+      <strong>Quantidade Solicitada:</strong> ${item.qtd}<br>
+      <strong>Requisitante (PCP):</strong> ${dadosSol.pcp || "-"}<br>
+      <strong>Nº OP:</strong> ${item.op}<br>
+      <strong>Linha:</strong> ${dadosSol.linhaProducao || "-"}<br>
+      <strong>Cliente:</strong> ${dadosSol.cliente || "-"}
+    </p>
+
+    <p>
+      <strong>Pendência:</strong> ${opts.tituloPendencia}<br>
+      <strong>Cód.:</strong> ${item.codigo}${opts.detalhePendenciaExtra || ""}
+    </p>
+
+    <p>
+      <strong style="${tituloVerde}">${opts.tituloAcao || "Ação Necessária:"}</strong><br>
+      ${opts.textoAcaoNecessaria}
+    </p>
+
+    ${opts.botaoConfirmacaoHtml || ""}
+
+    ${opts.mostrarAvisoUrgencia === false ? "" : `
+    <p style="font-weight:bold;">
+      <strong style="${tituloVermelho}">Atentar para as considerações abaixo:</strong><br>
+      Ao receber esse email, por favor considere a solicitação em regime de urgência! A ordem de Produção (OP), já foi direcionada para separação e atendimento das linhas produtivas.
+      <br><br>
+      Necessário responder esse e-mail, o mais breve possível. Informar um retorno positivo ou com negativa ao atendimento. Para que todos os endereçados, possam ter ciência, do status da solicitação.
+      <br><br>
+      Todas as: questões, registros ou dúvidas, devem ser tratadas em resposta a esse email. Assim deixamos os registros em um único meio de comunicação.
+    </p>
+    `}
+
+    <p style="margin-top:32px;">
+      ${opts.mostrarColaboracao === false ? "" : "Contamos com a vossa colaboração.<br>Obrigado.<br>"}
+      <strong>Nome: ${opts.admNome} — Logística</strong>
+    </p>
+  </div>
+  `;
+}
+
+// Saudação que muda sozinha conforme o horário de envio: antes do meio-dia
+// vira "Bom dia", até as 18h vira "Boa tarde", depois disso "Boa noite".
+function saudacaoPorHorario_() {
+  const hora = Number(Utilities.formatDate(new Date(), getFusoHorario(), "H"));
+  if (hora < 12) return "Bom dia";
+  if (hora < 18) return "Boa tarde";
+  return "Boa noite";
+}
+
+// Monta o botão verde "Confirmar" que vai dentro do e-mail de Sem Requisição
+// / Em Depósito Qualidade — é ele (não o texto livre da resposta por e-mail)
+// que registra de verdade que a ação foi feita, já que uma resposta escrita
+// qualquer ("ainda não deu", "não pode", etc.) não significa que a
+// requisição foi aplicada ou o material liberado. Ao clicar, abre a página
+// de confirmação do próprio sistema (ver processarConfirmacaoAvisoPorLink_).
+//
+// DESATIVADO POR ENQUANTO (ver BOTAO_CONFIRMACAO_ATIVO lá em cima) — agora
+// que o texto da resposta já aparece direto na timeline, sem precisar
+// clicar em nada, o time achou o botão desnecessário por ora. O resto da
+// engrenagem (processarConfirmacaoAvisoPorLink_, item.avisoConfirmado etc.)
+// continua no código — é só virar BOTAO_CONFIRMACAO_ATIVO pra true se
+// decidir voltar a usar depois.
+function montarBotaoConfirmacaoAviso_(idReal, codigo, tipoAviso, chave) {
+  if (!BOTAO_CONFIRMACAO_ATIVO || !chave) return "";
+  const baseUrl = URL_WEBAPP_COM_LOGIN || ScriptApp.getService().getUrl();
+  const url = `${baseUrl}?confirmarAviso=1&id=${encodeURIComponent(idReal)}&codigo=${encodeURIComponent(codigo)}&tipo=${encodeURIComponent(tipoAviso)}&chave=${encodeURIComponent(chave)}`;
+  const textoBotao = tipoAviso === "SEM_REQUISICAO" ? "✅ Confirmar requisição aplicada" : "✅ Confirmar material liberado";
+  return `
+    <p style="margin-top:20px;padding:14px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;">
+      <a href="${url}" target="_blank" style="display:inline-block;background:#059669;color:#ffffff;text-decoration:none;font-weight:bold;padding:10px 18px;border-radius:6px;font-size:13px;">${textoBotao}</a>
+      <br><span style="font-size:11px;color:#4b5563;display:inline-block;margin-top:8px;">Clique aqui só depois de já ter feito a ação de verdade — é isso que confirma pro sistema, não a resposta por escrito deste e-mail.</span>
+    </p>
+  `;
+}
+
+// Aviso de "Sem Requisição" pro Time PCP — usa o estilo padrão acima, só
+// preenchendo os textos específicos desse tipo (inclui Qtde Pendente/Obs,
+// que só fazem sentido pra esse caso).
+function montarCorpoHtmlSemRequisicao_(dadosSol, item, admNome, qtdePendente, resumoRolos) {
+  return montarCorpoHtmlAvisoEquipe_({
+    dadosSol: dadosSol,
+    item: item,
+    admNome: admNome,
+    nomeTime: "Time PCP",
+    tituloRegistro: "Registro de Pendência para pagamento de material solicitado para Produção",
+    tituloPendencia: "Material Sem Requisição - para movimentação em Sistema.",
+    detalhePendenciaExtra: `<br><strong>Resultado (Saldo Pendente).:</strong> ${qtdePendente}<br><strong>Obs:</strong> ${resumoRolos}`,
+    textoAcaoNecessaria: "Por favor, criar requisição no SAP - para realização de baixa do material, para atendimento da produção.",
+    botaoConfirmacaoHtml: montarBotaoConfirmacaoAviso_(item.idReal, item.codigo, "SEM_REQUISICAO", item.avisoConfirmChave)
+  });
+}
+
+// Aviso de "Em Depósito Qualidade" pro Time Qualidade — usa o MESMO estilo padrão,
+// só o texto muda pro contexto do material parado no Depósito Qualidade.
+function montarCorpoHtmlDeposito0700_(dadosSol, item, admNome, detalheExtra) {
+  const localQualidade = (detalheExtra && (detalheExtra.localQualidade || detalheExtra.local || (typeof detalheExtra === "string" ? detalheExtra : ""))) || "";
+  const textoLocalExtra = localQualidade ? `<br><strong>Local na Qualidade (Dep/Rec).:</strong> ${localQualidade}` : "";
+
+  return montarCorpoHtmlAvisoEquipe_({
+    dadosSol: dadosSol,
+    item: item,
+    admNome: admNome,
+    nomeTime: "Time Qualidade",
+    tituloRegistro: "Registro de Pendência - Material identificado no Depósito Qualidade",
+    tituloPendencia: "Material em Depósito Qualidade - para liberação/movimentação em Sistema.",
+    detalhePendenciaExtra: `<br><strong>Resultado (Saldo Pendente).:</strong> ${item.saldoPendente !== undefined ? item.saldoPendente : item.qtd}${textoLocalExtra}`,
+    textoAcaoNecessaria: "Por favor, verificar e liberar o material no Depósito Qualidade, para atendimento da produção.",
+    botaoConfirmacaoHtml: montarBotaoConfirmacaoAviso_(item.idReal, item.codigo, "DEPOSITO_0700", item.avisoConfirmChave)
+  });
+}
+
+// Aviso de "Sem Estoque" pros Times Logística e PCP — usa o MESMO estilo padrão.
+// Diferente dos outros dois, esse é só um AVISO (não pede nenhuma ação de volta) — a
+// pendência foi encerrada no sistema por falta de material.
+function montarCorpoHtmlSemEstoque_(dadosSol, item, admNome) {
+  const saldoPendente = Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd);
+  const qtdTotal = Number(item.qtd || 0);
+  const qtdPaga = Number(item.qtdPagaTotal || (qtdTotal > saldoPendente ? (qtdTotal - saldoPendente) : 0));
+
+  let detalheExtra = `<br><strong>Quantidade Sem Estoque (em falta):</strong> ${saldoPendente}`;
+  if (qtdPaga > 0) {
+    detalheExtra += `<br><strong>Quantidade Atendida / Paga Anteriormente:</strong> ${qtdPaga}`;
+    detalheExtra += `<br><strong>Quantidade Total Solicitada:</strong> ${qtdTotal}`;
+  }
+
+  const textoAcao = qtdPaga > 0
+    ? `Informamos que o saldo restante de <strong>${saldoPendente} pcs</strong> (de um total de ${qtdTotal} pcs solicitadas, sendo ${qtdPaga} pcs já atendidas) está SEM ESTOQUE no momento, e a pendência foi encerrada no sistema.`
+    : `Informamos que o material solicitado (<strong>${saldoPendente} pcs</strong>) está SEM ESTOQUE no momento, e a solicitação foi zerada no sistema.`;
+
+  return montarCorpoHtmlAvisoEquipe_({
+    dadosSol: dadosSol,
+    item: item,
+    admNome: admNome,
+    nomeTime: "Times Logística e PCP",
+    tituloRegistro: "Registro de Pendência - Material Sem Estoque",
+    tituloPendencia: qtdPaga > 0 ? "Material Parcialmente Sem Estoque - saldo restante encerrado em Sistema." : "Material Sem Estoque - solicitação zerada em Sistema.",
+    detalhePendenciaExtra: detalheExtra,
+    tituloAcao: "Ação Realizada:",
+    textoAcaoNecessaria: textoAcao,
+    mostrarAvisoUrgencia: false,
+    mostrarColaboracao: false
+  });
+}
+
+// Envia o aviso pra equipe certa, conforme o tipo. Não trava a ação principal
+// (registrar sem requisição/sem estoque/0700) se o e-mail falhar por
+// qualquer motivo (equipe sem e-mail cadastrado, MailApp fora do ar etc.) —
+// só registra no log, pra não travar quem está usando o sistema por causa
+// de um problema no envio.
+function enviarAvisoEquipe_(tipoAviso, dadosSol, item, admNome, detalheExtra) {
+  try {
+    let email, assunto;
+    if (tipoAviso === "SEM_ESTOQUE") {
+      // Aviso de Sem Estoque vai pra Logística, PCP e também Qualidade (IR) —
+      // todo mundo direto no "Para", sem CC, já que aqui não tem ninguém
+      // precisando ficar só "ciente" — as 3 equipes têm algum interesse
+      // direto no material que ficou sem estoque.
+      const emailLogistica = obterEmailEquipe_("LOGISTICA");
+      const emailPcp = obterEmailEquipe_("PCP");
+      const emailIr = obterEmailEquipe_("IR");
+      const listaDestinatarios = [];
+      if (emailLogistica) listaDestinatarios.push(...emailLogistica.split(",").map(e => e.trim()).filter(Boolean));
+      if (emailPcp) listaDestinatarios.push(...emailPcp.split(",").map(e => e.trim()).filter(Boolean));
+      if (emailIr) listaDestinatarios.push(...emailIr.split(",").map(e => e.trim()).filter(Boolean));
+      const destinatariosUnicos = [...new Set(listaDestinatarios)];
+      email = destinatariosUnicos.length > 0 ? destinatariosUnicos.join(",") : null;
+      assunto = `Registro de Pendência - Material Sem Estoque - Cód. ${item.codigo}`;
+    } else if (tipoAviso === "SEM_REQUISICAO") {
+      email = obterEmailEquipe_("PCP");
+      assunto = "Registro de Pendência para pagamento de material solicitado para Produção";
+    } else if (tipoAviso === "DEPOSITO_0700") {
+      email = obterEmailEquipe_("IR");
+      assunto = `Registro de Pendência - Material identificado no Depósito Qualidade - Cód. ${item.codigo}`;
+    } else {
+      return { enviado: false, motivo: "Tipo de aviso desconhecido." };
+    }
+
+    if (!email) {
+      const nomeEquipeErro = tipoAviso === "SEM_ESTOQUE" ? "Logística / PCP / Qualidade" : (tipoAviso === "SEM_REQUISICAO" ? "PCP" : "IR");
+      Logger.log(`Aviso "${tipoAviso}" não enviado — e-mail da equipe ${nomeEquipeErro} não cadastrado na aba ${NOME_ABA_EMAILS_EQUIPES}.`);
+      return { enviado: false, motivo: `E-mail da equipe ${nomeEquipeErro} não cadastrado.` };
+    }
+
+    // Logística sempre entra em cópia (CC) nos avisos de Sem Requisição e
+    // Depósito Qualidade — quer ficar ciente mesmo sem ser quem precisa agir.
+    const emailCcLogistica = obterEmailEquipe_("LOGISTICA") || "";
+
+    if (tipoAviso === "SEM_REQUISICAO") {
+      // Modelo novo (HTML com caixas coloridas) — detalheExtra aqui carrega
+      // { qtdePendente, resumoRolos } em vez do texto solto de antes.
+      // Usa GmailApp (não MailApp) pra dar pra localizar a thread depois e
+      // checar automaticamente se o time PCP respondeu (ver
+      // verificarRespostasAvisos_). O token de rastreio vai como uma linha
+      // discreta no rodapé — precisa ser texto visível de verdade (não
+      // comentário HTML) pra entrar no índice de busca do Gmail.
+      const tokenRastreio = Utilities.getUuid();
+      const corpoHtml = montarCorpoHtmlSemRequisicao_(dadosSol, item, admNome, (detalheExtra && detalheExtra.qtdePendente) || item.qtd || "-", (detalheExtra && detalheExtra.resumoRolos) || "-")
+        + `<p style="font-size:9px;color:#cbd5e1;margin-top:14px;">Ref: ${tokenRastreio}</p>`;
+      GmailApp.sendEmail(email, assunto, `Registro de Pendência — Solicitação Nº ${dadosSol.id}, código ${item.codigo}. Veja os detalhes na versão HTML deste e-mail.`, {
+        htmlBody: corpoHtml,
+        name: "Requisições de Materiais",
+        cc: emailCcLogistica
+      });
+      return { enviado: true, para: email, threadId: localizarThreadEnviado_(tokenRastreio) };
+    }
+
+    if (tipoAviso === "DEPOSITO_0700") {
+      // Mesmo modelo novo (HTML com caixas coloridas), pro Time Qualidade —
+      // mesmo raciocínio de rastreio via GmailApp que o SEM_REQUISICAO acima.
+      const tokenRastreio = Utilities.getUuid();
+      const corpoHtml = montarCorpoHtmlDeposito0700_(dadosSol, item, admNome, detalheExtra)
+        + `<p style="font-size:9px;color:#cbd5e1;margin-top:14px;">Ref: ${tokenRastreio}</p>`;
+      GmailApp.sendEmail(email, assunto, `Material em Depósito Qualidade — Solicitação Nº ${dadosSol.id}, código ${item.codigo}. Veja os detalhes na versão HTML deste e-mail.`, {
+        htmlBody: corpoHtml,
+        name: "Requisições de Materiais",
+        cc: emailCcLogistica
+      });
+      return { enviado: true, para: email, threadId: localizarThreadEnviado_(tokenRastreio) };
+    }
+
+    if (tipoAviso === "SEM_ESTOQUE") {
+      const corpoHtml = montarCorpoHtmlSemEstoque_(dadosSol, item, admNome);
+      MailApp.sendEmail({
+        to: email,
+        subject: assunto,
+        htmlBody: corpoHtml,
+        body: `Material Sem Estoque — Solicitação Nº ${dadosSol.id}, código ${item.codigo}. Veja os detalhes na versão HTML deste e-mail.`,
+        name: "Requisições de Materiais"
+      });
+      return { enviado: true, para: email };
+    }
+
+    // Não deveria chegar aqui — os 3 tipos válidos (SEM_ESTOQUE, SEM_REQUISICAO,
+    // DEPOSITO_0700) já retornam mais acima. Mantido só como rede de segurança.
+    return { enviado: false, motivo: "Tipo de aviso sem modelo de e-mail definido." };
+  } catch (e) {
+    Logger.log("Falha ao enviar aviso por e-mail: " + (e && e.message ? e.message : e));
+    return { enviado: false, motivo: (e && e.message) || String(e) };
+  }
+}
+
+// Logo depois de mandar um e-mail via GmailApp, procura a thread correspondente
+// pelo token de rastreio (texto único, discreto, no rodapé do e-mail) — é o
+// jeito de descobrir o ID da thread, já que GmailApp.sendEmail não devolve
+// nada. Um pequeno sleep antes da busca dá tempo do Gmail indexar o envio.
+// Se não achar (raro — ex: indexação demorou mais que o esperado), retorna
+// null e o rastreio de resposta simplesmente fica desativado pra esse e-mail
+// específico; o envio em si já aconteceu normalmente.
+function localizarThreadEnviado_(tokenRastreio) {
+  try {
+    Utilities.sleep(1500);
+    const threads = GmailApp.search('in:sent "' + tokenRastreio + '"', 0, 1);
+    return threads.length > 0 ? threads[0].getId() : null;
+  } catch (e) {
+    Logger.log("Não foi possível localizar a thread do e-mail enviado (rastreio " + tokenRastreio + "): " + (e && e.message ? e.message : e));
+    return null;
+  }
+}
+
+// Grava o ID da thread do Gmail no item, depois que o e-mail já foi enviado
+// de verdade (não dá pra saber a thread antes de mandar). Chamada separada,
+// com seu próprio lock curto — não é crítico, se falhar o aviso já foi
+// enviado do mesmo jeito, só o rastreio automático de resposta é que fica
+// sem funcionar pra esse item.
+function salvarThreadIdAviso_(id, codigo, threadId) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+  try {
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosAba = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosAba.length; i++) {
+      if (dadosAba[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) return;
+    const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+    const item = itens.find(it => it.codigo === codigo);
+    if (!item) return;
+    item.avisoThreadId = threadId;
+    abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itens));
+  } catch (e) {
+    Logger.log("Falha ao salvar threadId do aviso: " + (e && e.message ? e.message : e));
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Roda periodicamente (via trigger — ver configurarVerificacaoRespostasAvisos)
+ * e também a cada carregamento do sistema (carregarDadosSistema_). Pra cada
+ * item pendente marcado "Sem Requisição" ou "Em Depósito Qualidade" que já
+ * tem thread de e-mail rastreada e ainda não foi marcado como respondido,
+ * abre a thread no Gmail e procura por uma resposta vinda de alguém da
+ * equipe certa (PCP ou IR, usando a mesma lista já cadastrada em
+ * Emails_Equipes). Se achar, marca o item como respondido (nome, e-mail,
+ * data/hora, link e um trecho da resposta) e registra o evento na timeline
+ * de movimentações da solicitação.
+ */
+function verificarRespostasAvisos_() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(3000)) return; // não é crítico — tenta de novo no próximo carregamento/trigger
+  try {
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosSol = abaSol.getDataRange().getValues();
+
+    for (let i = 1; i < dadosSol.length; i++) {
+      if (dadosSol[i][4] !== "PENDENTE" && dadosSol[i][4] !== "PARCIAL") continue;
+      const itens = JSON.parse(dadosSol[i][5] || "[]");
+      let mudouItens = false;
+
+      itens.forEach(function(item) {
+        if (!item.avisoThreadId || item.avisoRespondido) return;
+
+        const tipoAviso = (item.observacao && item.observacao.indexOf("[SEM REQUISIÇÃO]") === 0) ? "SEM_REQUISICAO"
+          : (item.observacao && item.observacao.indexOf("[EM DEPÓSITO QUALIDADE]") === 0) ? "DEPOSITO_0700"
+          : null;
+        if (!tipoAviso) return;
+
+        const emailsEquipeStr = obterEmailEquipe_(tipoAviso === "SEM_REQUISICAO" ? "PCP" : "IR") || "";
+        const emailsEquipe = emailsEquipeStr.split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+        if (emailsEquipe.length === 0) return;
+
+        let thread;
+        try {
+          thread = GmailApp.getThreadById(item.avisoThreadId);
+        } catch (e) {
+          return; // thread não existe/foi removida — ignora, não é crítico
+        }
+        if (!thread) return;
+
+        const mensagens = thread.getMessages();
+        // mensagens[0] é o e-mail original que o próprio sistema mandou —
+        // procura, entre as seguintes, a primeira resposta de alguém da
+        // equipe certa.
+        for (let m = 1; m < mensagens.length; m++) {
+          const msg = mensagens[m];
+          const remetenteBruto = msg.getFrom() || "";
+          const emailMatch = remetenteBruto.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+          const emailRemetente = emailMatch ? emailMatch[0].toLowerCase() : "";
+          if (emailsEquipe.indexOf(emailRemetente) === -1) continue;
+
+          // Nome exibido: prioriza o cadastro manual em Nomes_Contatos (garante
+          // sempre "Nome Sobrenome"); se a pessoa ainda não foi cadastrada lá,
+          // cai pro nome do cabeçalho "De:" do e-mail (pode vir só o primeiro
+          // nome, dependendo de como a pessoa configurou o Gmail dela), e só
+          // em último caso usa o e-mail cru.
+          const nomeMatch = remetenteBruto.match(/^"?([^"<]+)"?\s*</);
+          const nomeCadastrado = obterNomeContato_(emailRemetente);
+          const nomeRemetente = nomeCadastrado || (nomeMatch ? nomeMatch[1].trim() : emailRemetente);
+          const corpoResposta = extrairRespostaLimpa_(msg.getPlainBody() || "");
+
+          item.avisoRespondido = true;
+          item.avisoRespondidoPor = nomeRemetente;
+          item.avisoRespondidoEmail = emailRemetente;
+          item.avisoRespondidoEm = Utilities.formatDate(msg.getDate(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+          item.avisoRespondidoLink = "https://mail.google.com/mail/u/0/#all/" + thread.getId();
+          item.avisoRespondidoTrecho = corpoResposta.length > 3000 ? corpoResposta.slice(0, 3000) + "…" : corpoResposta;
+          item.avisoRespondidoEquipe = tipoAviso === "SEM_REQUISICAO" ? "PCP" : "IR";
+          mudouItens = true;
+          break;
+        }
+      });
+
+      if (mudouItens) {
+        abaSol.getRange(i + 1, 6).setValue(JSON.stringify(itens));
+
+        const historicoParcialAtual = JSON.parse(abaSol.getRange(i + 1, 7).getValue() || "[]");
+        itens.forEach(function(item) {
+          if (!item.avisoRespondido) return;
+          const jaTemEvento = historicoParcialAtual.some(ev =>
+            ev.tipoNota === "avisoRespondido" && ev.itensPagos && ev.itensPagos[0] &&
+            ev.itensPagos[0].codigo === item.codigo && ev.dataHora === item.avisoRespondidoEm
+          );
+          if (jaTemEvento) return;
+          historicoParcialAtual.push({
+            dataHora: item.avisoRespondidoEm,
+            responsavel: item.avisoRespondidoPor,
+            apenasNota: true,
+            tipoNota: "avisoRespondido",
+            itensPagos: [{
+              codigo: item.codigo,
+              op: item.op,
+              observacao: item.observacao,
+              equipe: item.avisoRespondidoEquipe,
+              email: item.avisoRespondidoEmail,
+              link: item.avisoRespondidoLink,
+              trecho: item.avisoRespondidoTrecho
+            }]
+          });
+        });
+        abaSol.getRange(i + 1, 7).setValue(JSON.stringify(historicoParcialAtual));
+      }
+    }
+  } catch (e) {
+    Logger.log("Falha ao verificar respostas de avisos: " + (e && e.message ? e.message : e));
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Wrapper pro trigger de tempo (ver configurarVerificacaoRespostasAvisos) —
+// garante que a planilha/abas existem antes de checar, igual o padrão já
+// usado em sincronizarBaixasSemRequisicaoAgendada.
+function verificarRespostasAvisosAgendada() {
+  iniciarPlanilha();
+  verificarRespostasAvisos_();
+}
+
+/**
+ * DIAGNÓSTICO — investiga por que a resposta de e-mail de uma solicitação
+ * específica não está sendo reconhecida. Rode pelo editor (Extensões > Apps
+ * Script, selecione "diagnosticarRespostaAviso442" no menu de funções ao
+ * lado de ▶ Executar, clique em Executar), depois abra "Execuções" (ícone de
+ * relógio), clique na execução que acabou de rodar e olhe os "Registros" —
+ * cada linha começando com "[DIAG]" mostra um ponto da investigação:
+ * se a thread do e-mail foi encontrada, quem mandou cada mensagem daquela
+ * conversa no Gmail, e qual é a lista de e-mails cadastrada pra equipe.
+ * Ajuste o ID no topo da função se precisar investigar outra solicitação.
+ */
+function diagnosticarRespostaAviso442() {
+  const idAlvo = "PCI-442"; // troque aqui pra investigar outra solicitação — é o ID de verdade salvo na planilha, com o prefixo "PCI-", não só o número que aparece na tela
+
+  const ss = getPlanilha();
+  const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+  const dadosAba = abaSol.getDataRange().getValues();
+  let linhaSol = -1;
+  for (let i = 1; i < dadosAba.length; i++) {
+    if (String(dadosAba[i][0]) === idAlvo) { linhaSol = i + 1; break; }
+  }
+  if (linhaSol === -1) {
+    Logger.log(`[DIAG] Solicitação ${idAlvo} não encontrada na aba ${NOME_ABA_SOLICITACOES} — já pode ter ido pro Histórico, ou o número está errado.`);
+    return;
+  }
+  Logger.log(`[DIAG] Solicitação ${idAlvo} encontrada na linha ${linhaSol}.`);
+
+  const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+  itens.forEach(function (item) {
+    Logger.log(`[DIAG] ---- Código ${item.codigo} ----`);
+    Logger.log(`[DIAG] observacao: ${item.observacao}`);
+    Logger.log(`[DIAG] avisoThreadId: ${item.avisoThreadId || "(VAZIO — a thread do e-mail nunca foi localizada no momento do envio, é essa a causa)"}`);
+    Logger.log(`[DIAG] avisoRespondido (já reconhecido antes): ${!!item.avisoRespondido}`);
+
+    if (!item.avisoThreadId) return;
+
+    let thread;
+    try {
+      thread = GmailApp.getThreadById(item.avisoThreadId);
+    } catch (e) {
+      Logger.log(`[DIAG] ERRO ao abrir a thread pelo ID salvo: ${e && e.message ? e.message : e}`);
+      return;
+    }
+    if (!thread) {
+      Logger.log("[DIAG] GmailApp.getThreadById não retornou nada pra esse ID — thread pode ter sido apagada/movida.");
+      return;
+    }
+
+    const mensagens = thread.getMessages();
+    Logger.log(`[DIAG] Thread encontrada, com ${mensagens.length} mensagem(ns):`);
+    mensagens.forEach(function (msg, m) {
+      Logger.log(`[DIAG]   Msg ${m} — de: "${msg.getFrom()}" em ${msg.getDate()}`);
+    });
+
+    const tipoAviso = (item.observacao && item.observacao.indexOf("[SEM REQUISIÇÃO]") === 0) ? "SEM_REQUISICAO"
+      : (item.observacao && item.observacao.indexOf("[EM DEPÓSITO QUALIDADE]") === 0) ? "DEPOSITO_0700"
+      : null;
+    Logger.log(`[DIAG] tipoAviso detectado a partir da observação: ${tipoAviso || "(nenhum — não bate com [SEM REQUISIÇÃO] nem [EM DEPÓSITO QUALIDADE])"}`);
+    if (!tipoAviso) return;
+
+    const nomeEquipe = tipoAviso === "SEM_REQUISICAO" ? "PCP" : "IR";
+    const emailsEquipeStr = obterEmailEquipe_(nomeEquipe) || "";
+    Logger.log(`[DIAG] Lista de e-mails cadastrada pra equipe ${nomeEquipe} (coluna "${nomeEquipe}" na aba ${NOME_ABA_EMAILS_EQUIPES}): "${emailsEquipeStr}"`);
+
+    const emailsEquipe = emailsEquipeStr.split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+    for (let m = 1; m < mensagens.length; m++) {
+      const remetenteBruto = mensagens[m].getFrom() || "";
+      const emailMatch = remetenteBruto.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+      const emailRemetente = emailMatch ? emailMatch[0].toLowerCase() : "";
+      const bate = emailsEquipe.indexOf(emailRemetente) !== -1;
+      Logger.log(`[DIAG]   Msg ${m}: e-mail extraído = "${emailRemetente}" — ${bate ? "BATE com a lista da equipe ✓" : "NÃO bate com a lista da equipe ✗"}`);
+    }
+  });
+}
+
+/**
+ * MARCAÇÃO MANUAL — usa isso só quando o Gmail estiver com a cota diária
+ * estourada (ver diagnosticarRespostaAviso442) e a resposta já foi
+ * confirmada visualmente no e-mail, sem precisar esperar a cota liberar.
+ * Marca o item como respondido do mesmo jeito que a checagem automática
+ * (verificarRespostasAvisos_) faria — grava no item e registra o evento na
+ * timeline — só que sem chamar o Gmail (não gasta cota nenhuma).
+ *
+ * Confira/ajuste os valores abaixo antes de rodar (o e-mail e o horário
+ * exato da resposta você confirma olhando o próprio e-mail no Gmail).
+ * Rode pelo editor (menu de funções ao lado de ▶ Executar).
+ */
+function marcarRespostaAvisoManual442() {
+  const idAlvo = "PCI-442";
+  const codigoAlvo = "48711";
+  const nomeRespondente = "ALINE JEPES FLORES";
+  const emailRespondente = "ajflores@cliptech.com.br";
+  const dataHoraResposta = "28/08/2026 08:21:00"; // ajuste se souber o horário exato, formato dd/MM/yyyy HH:mm:ss
+  const trechoResposta = "Bom dia,\n\nRequisitado.\n\nAtt.";
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(60000)) {
+    throw new Error(mensagemSistemaOcupado_("uma marcação manual de resposta"));
+  }
+  try {
+    registrarProcessamentoEmAndamento_("uma marcação manual de resposta", "marcação manual (sem Gmail)");
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosAba = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosAba.length; i++) {
+      if (String(dadosAba[i][0]) === idAlvo) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) {
+      Logger.log(`[MANUAL] Solicitação ${idAlvo} não encontrada — já pode ter ido pro Histórico, ou o ID mudou.`);
+      return;
+    }
+
+    const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+    const item = itens.find(it => it.codigo === codigoAlvo);
+    if (!item) {
+      Logger.log(`[MANUAL] Código ${codigoAlvo} não encontrado na solicitação ${idAlvo}.`);
+      return;
+    }
+    if (item.avisoRespondido) {
+      Logger.log("[MANUAL] Esse item já estava marcado como respondido — nada a fazer.");
+      return;
+    }
+
+    const tipoAviso = (item.observacao && item.observacao.indexOf("[SEM REQUISIÇÃO]") === 0) ? "SEM_REQUISICAO"
+      : (item.observacao && item.observacao.indexOf("[EM DEPÓSITO QUALIDADE]") === 0) ? "DEPOSITO_0700"
+      : null;
+
+    item.avisoRespondido = true;
+    item.avisoRespondidoPor = nomeRespondente;
+    item.avisoRespondidoEmail = emailRespondente;
+    item.avisoRespondidoEm = dataHoraResposta;
+    item.avisoRespondidoLink = item.avisoThreadId ? ("https://mail.google.com/mail/u/0/#all/" + item.avisoThreadId) : "";
+    item.avisoRespondidoTrecho = trechoResposta;
+    item.avisoRespondidoEquipe = tipoAviso === "SEM_REQUISICAO" ? "PCP" : "IR";
+
+    abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itens));
+
+    const historicoParcialAtual = JSON.parse(abaSol.getRange(linhaSol, 7).getValue() || "[]");
+    historicoParcialAtual.push({
+      dataHora: item.avisoRespondidoEm,
+      responsavel: item.avisoRespondidoPor,
+      apenasNota: true,
+      tipoNota: "avisoRespondido",
+      itensPagos: [{
+        codigo: item.codigo,
+        op: item.op,
+        observacao: item.observacao,
+        equipe: item.avisoRespondidoEquipe,
+        email: item.avisoRespondidoEmail,
+        link: item.avisoRespondidoLink,
+        trecho: item.avisoRespondidoTrecho
+      }]
+    });
+    abaSol.getRange(linhaSol, 7).setValue(JSON.stringify(historicoParcialAtual));
+
+    Logger.log(`[MANUAL] Pronto! Item ${codigoAlvo} da solicitação ${idAlvo} marcado como respondido por ${nomeRespondente} em ${dataHoraResposta}.`);
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+/**
+ * MANUTENÇÃO — roda uma vez só (seleciona essa função no editor e clica
+ * Executar, ou pelo menu 🔧 Ferramentas PCI na planilha), depois de
+ * atualizar o código com uma versão nova de extrairRespostaLimpa_.
+ * Reprocessa TODOS os textos de resposta já gravados — TANTO nas
+ * solicitações ainda pendentes/parciais QUANTO nas já finalizadas (movidas
+ * pro Histórico) — com a regra de corte atual, sem precisar buscar nada de
+ * novo no Gmail (o texto já cru continua guardado, só reaplica o corte em
+ * cima dele). Útil quando a regra de corte muda (ex: passou a cortar em
+ * "[image:" também) e sobrou texto antigo salvo do jeito errado, de antes
+ * da correção.
+ *
+ * Limpa em DOIS lugares — os dois guardam uma cópia do texto, de forma
+ * independente: 1) item.avisoRespondidoTrecho (dentro de Itens_JSON — é o
+ * que o selo da fila usa) e 2) itensPagos[].trecho, dentro de cada evento
+ * "avisoRespondido" salvo em Detalhes_Pagamento_JSON (é o que a timeline com
+ * ícones do modal Histórico usa). Sem os dois, uma das duas telas continua
+ * mostrando o texto velho mesmo depois de "limpar".
+ */
+function limparRespostasAntigasArmazenadas_() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    Logger.log("Sistema ocupado, tente rodar de novo em instantes.");
+    return;
+  }
+  try {
+    const ss = getPlanilha();
+    let totalLimpo = 0;
+
+    // Limpa o(s) evento(s) "avisoRespondido" dentro de um array
+    // historicoParcial — devolve true se algo mudou.
+    function limparHistoricoParcial(historicoParcial) {
+      let mudouAlgo = false;
+      (historicoParcial || []).forEach(function(evento) {
+        if (evento.tipoNota !== "avisoRespondido") return;
+        (evento.itensPagos || []).forEach(function(ip) {
+          if (!ip.trecho) return;
+          const limpo = extrairRespostaLimpa_(ip.trecho);
+          if (limpo !== ip.trecho) {
+            ip.trecho = limpo;
+            mudouAlgo = true;
+            totalLimpo++;
+          }
+        });
+      });
+      return mudouAlgo;
+    }
+
+    // 1) Solicitações ainda pendentes/parciais (aba Solicitacoes_PCI):
+    // coluna F = Itens_JSON, coluna G = Detalhes_Pagamento_JSON
+    // (historicoParcial).
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosSol = abaSol.getDataRange().getValues();
+    for (let i = 1; i < dadosSol.length; i++) {
+      if (dadosSol[i][4] !== "PENDENTE" && dadosSol[i][4] !== "PARCIAL") continue;
+
+      const itens = JSON.parse(dadosSol[i][5] || "[]");
+      let mudouItens = false;
+      itens.forEach(function(item) {
+        if (!item.avisoRespondidoTrecho) return;
+        const limpo = extrairRespostaLimpa_(item.avisoRespondidoTrecho);
+        if (limpo !== item.avisoRespondidoTrecho) {
+          item.avisoRespondidoTrecho = limpo;
+          mudouItens = true;
+          totalLimpo++;
+        }
+      });
+      if (mudouItens) {
+        abaSol.getRange(i + 1, 6).setValue(JSON.stringify(itens));
+      }
+
+      const historicoParcial = JSON.parse(dadosSol[i][6] || "[]");
+      if (limparHistoricoParcial(historicoParcial)) {
+        abaSol.getRange(i + 1, 7).setValue(JSON.stringify(historicoParcial));
+      }
+    }
+
+    // 2) Solicitações já finalizadas (aba Historico_PCI): coluna H =
+    // Itens_JSON (índice 7), coluna I = Detalhes_Pagamento_JSON (índice 8).
+    const abaHist = ss.getSheetByName(NOME_ABA_HISTORICO);
+    if (abaHist && abaHist.getLastRow() > 1) {
+      const dadosHist = abaHist.getRange(2, 1, abaHist.getLastRow() - 1, 9).getValues();
+      dadosHist.forEach(function(linha, idx) {
+        const itens = JSON.parse(linha[7] || "[]");
+        let mudouItens = false;
+        itens.forEach(function(item) {
+          if (!item.avisoRespondidoTrecho) return;
+          const limpo = extrairRespostaLimpa_(item.avisoRespondidoTrecho);
+          if (limpo !== item.avisoRespondidoTrecho) {
+            item.avisoRespondidoTrecho = limpo;
+            mudouItens = true;
+            totalLimpo++;
+          }
+        });
+        if (mudouItens) {
+          abaHist.getRange(idx + 2, 8).setValue(JSON.stringify(itens));
+        }
+
+        const historicoParcial = JSON.parse(linha[8] || "[]");
+        if (limparHistoricoParcial(historicoParcial)) {
+          abaHist.getRange(idx + 2, 9).setValue(JSON.stringify(historicoParcial));
+        }
+      });
+    }
+
+    const mensagemFinal = "Prontinho — " + totalLimpo + " resposta(s) reprocessada(s) com a regra de corte atual (pendentes + histórico, nos dois lugares onde o texto fica guardado).";
+    Logger.log(mensagemFinal);
+    try {
+      SpreadsheetApp.getUi().alert(mensagemFinal);
+    } catch (e) {
+      // Rodando fora da UI (direto no editor) — sem alerta, sem problema, já foi pro log.
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Corta o texto citado (o e-mail original "colado" abaixo pelo Gmail/Outlook
+// quando alguém responde) do corpo da resposta, deixando só o que a pessoa
+// escreveu de fato — senão o texto mostrado ficaria poluído com a mensagem
+// inteira do sistema repetida embaixo.
+function extrairRespostaLimpa_(corpo) {
+  if (!corpo) return "";
+  const marcadoresCorte = [
+    /\n\s*Em .{0,100} escreveu:/i,      // Gmail PT-BR: "Em qua., 17 de ago..., X escreveu:"
+    /\n\s*On .{0,100} wrote:/i,          // Gmail EN
+    /\n-{2,}\s*Mensagem original\s*-{2,}/i,
+    /\n-{2,}\s*Original Message\s*-{2,}/i,
+    /\n\s*De:\s.+\nEnviada?\s?em:/i,
+    /\n\s*From:\s.+\nSent:/i,
+    /\n>{1,}\s/,
+    // Assinatura de e-mail com imagem embutida (foto, logo, ícone de
+    // telefone/site) — o Gmail exporta cada uma como "[image: nome]" no
+    // texto puro. Isso quase nunca aparece no meio de uma resposta de
+    // verdade, só no bloco de assinatura no final — cortar aqui evita
+    // mostrar a assinatura inteira (telefone, endereço, textos legais etc.)
+    // junto com a resposta de verdade.
+    /\n\s*\[image:/i
+  ];
+  let corte = corpo.length;
+  marcadoresCorte.forEach(function(re) {
+    const m = corpo.match(re);
+    if (m && typeof m.index === "number" && m.index < corte) corte = m.index;
+  });
+  let limpo = corpo.slice(0, corte).trim();
+  // Rede de segurança extra pra assinaturas só de texto (sem "[image:"), que
+  // o corte acima não pega — nunca deixa a resposta capturada passar de um
+  // tamanho razoável de leitura.
+  if (limpo.length > 1200) limpo = limpo.slice(0, 1200).trim() + "…";
+  return limpo;
+}
+
+/**
+ * Roda UMA VEZ (pelo editor de Apps Script, selecionando essa função e
+ * clicando "Executar", ou pelo menu "🔧 Ferramentas PCI" na planilha) pra
+ * ativar a checagem automática de respostas a cada 5 minutos. Pode rodar de
+ * novo sem medo — remove o trigger antigo antes de criar um novo, então
+ * nunca duplica.
+ */
+function configurarVerificacaoRespostasAvisos() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === "verificarRespostasAvisosAgendada") ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger("verificarRespostasAvisosAgendada")
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+  try {
+    SpreadsheetApp.getUi().alert("Pronto! A cada 15 minutos o sistema vai checar automaticamente, no Gmail, se o time PCP respondeu os avisos de Sem Requisição, e se o time IR respondeu os de Depósito Qualidade — mesmo com o sistema fechado. (Trocado de 5 pra 15 minutos pra economizar a cota diária do Gmail do Apps Script.)");
+  } catch (e) {
+    // Rodando fora da UI (direto no editor) — sem alerta, sem problema.
+  }
+}
+
+/**
+ * Dispara o aviso por e-mail de um item já classificado (Sem Requisição,
+ * Sem Estoque ou Em Depósito Qualidade) — só o ADM da Logística pode chamar.
+ * Diferente da classificação em si (aberta pra qualquer um da Logística),
+ * disparar o e-mail é uma ação separada e exclusiva do ADM: ele confere,
+ * digita o próprio nome, e só então o aviso sai pro time responsável.
+ *
+ * Pra "Sem Requisição" especificamente, é AQUI (na confirmação do ADM) que
+ * as linhas de verdade entram na planilha do Requisição Manual — antes
+ * disso (na classificação, aberta a qualquer um da Logística) os dados do
+ * lote/rolo ficam só guardados no item (item.rolosSemRequisicao), esperando
+ * o ADM revisar. Item continua PENDENTE do mesmo jeito depois — só fica
+ * registrado que já foi confirmado e o aviso saiu.
+ *
+ * Pra "Sem Estoque", o item fica PENDENTE até aqui — é só quando o e-mail é
+ * confirmado que o item é resolvido de verdade (saldo zerado, sai das
+ * pendências), delegando pra processarBaixaSeparacao_.
+ * "Em Depósito Qualidade" continua pendente do mesmo jeito depois do
+ * envio — só fica registrado que o aviso já saiu.
+ */
+function dispararAvisoEquipeAdm(dados) {
+  const id = String((dados && dados.id) || "").trim();
+  const codigo = String((dados && dados.codigo) || "").trim();
+  const tipoAviso = String((dados && dados.tipoAviso) || "").trim();
+  const admNome = String((dados && dados.admNome) || "").trim();
+  const localQualidade = String((dados && dados.localQualidade) || "").trim();
+  const setorAtuante = String((dados && dados.setorAtuante) || "").trim();
+
+  if (setorAtuante !== "LOGISTICA_ADM") {
+    throw new Error("Só assistentes/técnicos podem disparar esse e-mail.");
+  }
+  if (!id) throw new Error("ID da solicitação não informado.");
+  if (!codigo) throw new Error("Código do item não informado.");
+  if (!admNome) throw new Error("Informe seu nome antes de disparar o aviso.");
+  if (tipoAviso === "DEPOSITO_0700" && !localQualidade) {
+    throw new Error("Informe o local (dep/Rec) na Qualidade antes de disparar o e-mail.");
+  }
+  if (["SEM_REQUISICAO", "SEM_ESTOQUE", "DEPOSITO_0700"].indexOf(tipoAviso) === -1) {
+    throw new Error("Tipo de aviso inválido.");
+  }
+
+  const marcador = tipoAviso === "SEM_REQUISICAO" ? "[SEM REQUISIÇÃO]"
+    : tipoAviso === "SEM_ESTOQUE" ? "[SEM ESTOQUE]"
+    : "[EM DEPÓSITO QUALIDADE]";
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("um aviso de equipe"));
+  }
+
+  let dadosSol, itemParaEmail, detalheExtra, agora, jaEstavaEnviado;
+  try {
+    registrarProcessamentoEmAndamento_("um aviso de equipe", admNome);
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosAba = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosAba.length; i++) {
+      if (dadosAba[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) {
+      throw new Error("Esta solicitação não foi encontrada — provavelmente já foi finalizada. Atualize a tela.");
+    }
+
+    const linhaCompleta = dadosAba[linhaSol - 1];
+    const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+    const item = itens.find(it => it.codigo === codigo);
+    if (!item) throw new Error(`Item com código ${codigo} não encontrado nesta solicitação.`);
+
+    if (!item.observacao || item.observacao.indexOf(marcador) !== 0) {
+      throw new Error("Esse item não está mais classificado assim — atualize a tela e tente de novo.");
+    }
+    // Se o aviso já foi enviado antes, normalmente bloqueia reenvio — MAS, pro
+    // caso específico de "Sem Estoque" que ficou preso (e-mail já saiu, mas o
+    // item nunca foi resolvido — saldo ainda pendente), deixa tentar de novo
+    // SEM reenviar o e-mail, só reprocessando a resolução que falhou antes.
+    const saldoAtualItem = Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd);
+    const ehRetentativaDeResolucaoPresa = tipoAviso === "SEM_ESTOQUE" && !!item.avisoEnviadoPor && saldoAtualItem > 0;
+    if (item.avisoEnviadoPor && !ehRetentativaDeResolucaoPresa) {
+      throw new Error(`O aviso desse item já foi enviado antes, por ${item.avisoEnviadoPor}.`);
+    }
+    jaEstavaEnviado = ehRetentativaDeResolucaoPresa;
+
+    agora = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+    dadosSol = {
+      id: numeroExibicaoId_(id),
+      cliente: linhaCompleta[11],
+      pcp: linhaCompleta[1],
+      logistica: linhaCompleta[2],
+      linhaProducao: linhaCompleta[9],
+      dataHoraRegistro: agora,
+      dataCriacaoSolicitacao: formatarDataCelula(linhaCompleta[3])
+    };
+    itemParaEmail = { codigo: item.codigo, op: item.op, tipo: item.tipo, qtd: item.qtd, saldoPendente: item.saldoPendente !== undefined ? item.saldoPendente : item.qtd };
+    if (tipoAviso === "SEM_REQUISICAO") {
+      detalheExtra = { qtdePendente: item.qtd, resumoRolos: item.observacao.replace(marcador + " ", "") };
+    } else if (tipoAviso === "DEPOSITO_0700") {
+      detalheExtra = { localQualidade: localQualidade };
+    }
+
+    if (!jaEstavaEnviado) {
+      // Pro caso "Sem Requisição": é só AGORA, quando o ADM confirma e
+      // dispara o e-mail, que as linhas de verdade entram no Requisição
+      // Manual (antes disso, o item já estava pendente aqui, mas do lado de
+      // lá ainda não existia nada — só depois do ADM revisar e confirmar).
+      // Guarda contra duplicar linha em caso de reenvio: só grava se ainda
+      // não tinha sido gravado antes.
+      if (tipoAviso === "SEM_REQUISICAO" && (!item.semRequisicaoLinha || item.semRequisicaoLinha.length === 0)) {
+        const rolosParaGravar = Array.isArray(item.rolosSemRequisicao) ? item.rolosSemRequisicao : [];
+        if (rolosParaGravar.length === 0) {
+          throw new Error("Esse item não tem os dados de lote/rolo salvos — reclassifique como Sem Requisição de novo antes de confirmar.");
+        }
+        const sheetReqManual = obterSheetRequisicaoManual_();
+        const linhasReqManual = [];
+        rolosParaGravar.forEach(function(rolo) {
+          sheetReqManual.appendRow([
+            item.codigo, rolo.quantidade, rolo.lote, String(linhaCompleta[2] || "").toUpperCase(),
+            String(item.responsavelRodada || "").toUpperCase(),
+            "", "", agora, "", item.tipo, item.op, rolo.loc, String(linhaCompleta[9] || "").toUpperCase()
+          ]);
+          linhasReqManual.push(sheetReqManual.getLastRow());
+        });
+        item.semRequisicaoLinha = linhasReqManual;
+      }
+
+      // Marca como "enviado" já aqui, otimisticamente — solta o lock antes de
+      // chamar o MailApp (que não precisa da planilha travada) pra não
+      // segurar o lock mais tempo do que precisa. Se o envio falhar de
+      // verdade, desfaz essa marcação logo abaixo.
+      item.avisoEnviadoPor = admNome;
+      item.avisoEnviadoEm = agora;
+      // Chave única do botão "Confirmar" que vai dentro do e-mail (só pros
+      // tipos SEM_REQUISICAO/DEPOSITO_0700 — SEM_ESTOQUE já é só um aviso, não
+      // pede confirmação de ação de volta). É ela que valida o clique lá no
+      // doGet — sem ela ninguém confirma nada só adivinhando a URL.
+      if (tipoAviso === "SEM_REQUISICAO" || tipoAviso === "DEPOSITO_0700") {
+        item.avisoConfirmChave = Utilities.getUuid();
+        itemParaEmail.avisoConfirmChave = item.avisoConfirmChave;
+        itemParaEmail.idReal = id; // id de verdade (com prefixo "PCI-") — o link do botão precisa dele, não do id de exibição
+      }
+      if (tipoAviso === "DEPOSITO_0700") {
+        item.dataHoraQualidade = item.dataHoraQualidade || agora;
+        item.responsavelQualidade = item.responsavelQualidade || admNome.toUpperCase();
+        item.localQualidade = localQualidade;
+      } else if (tipoAviso === "SEM_ESTOQUE") {
+        item.dataHoraSemEstoque = item.dataHoraSemEstoque || agora;
+        item.responsavelSemEstoque = item.responsavelSemEstoque || admNome.toUpperCase();
+      }
+      abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itens));
+      registrarSugestao_("ADM", admNome.toUpperCase());
+      registrarSugestao_("RESPONSAVEL", admNome.toUpperCase());
+
+
+      const historicoParcialAtual = JSON.parse(abaSol.getRange(linhaSol, 7).getValue() || "[]");
+      historicoParcialAtual.push({
+        dataHora: agora,
+        responsavel: admNome,
+        apenasNota: true,
+        tipoNota: "avisoEnviado",
+        itensPagos: [{
+          codigo: item.codigo,
+          op: item.op,
+          ot: "",
+          observacao: item.observacao,
+          tipoAviso: tipoAviso,
+          localQualidade: localQualidade || item.localQualidade || "",
+          dataHoraQualidade: item.dataHoraQualidade || "",
+          dataHoraSemEstoque: item.dataHoraSemEstoque || "",
+          qtdPaga: 0,
+          saldoRestante: Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd)
+        }]
+      });
+      abaSol.getRange(linhaSol, 7).setValue(JSON.stringify(historicoParcialAtual));
+    }
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+
+  // Se era uma retentativa de item preso (e-mail já tinha sido enviado antes
+  // de verdade), não manda de novo — só tenta resolver.
+  const resultadoEmail = jaEstavaEnviado
+    ? { enviado: true, para: "(reenvio não necessário — aviso original já confirmado)" }
+    : enviarAvisoEquipe_(tipoAviso, dadosSol, itemParaEmail, admNome.toUpperCase(), detalheExtra);
+
+  if (!resultadoEmail.enviado) {
+    // Envio falhou de verdade — desfaz a marcação de "enviado" que já
+    // tinha sido salva otimisticamente, pra dar pra tentar de novo depois.
+    desfazerAvisoEnviado_(id, codigo);
+    return { sucesso: false, avisoEmail: resultadoEmail };
+  }
+
+  // Guarda a thread do Gmail (quando achada) pra dar pra checar depois se o
+  // time PCP/IR respondeu. Só faz sentido numa rodada de envio de verdade,
+  // não numa retentativa de item preso.
+  if (!jaEstavaEnviado && resultadoEmail.threadId) {
+    salvarThreadIdAviso_(id, codigo, resultadoEmail.threadId);
+  }
+
+  if (tipoAviso === "SEM_ESTOQUE") {
+    // Só agora o item é resolvido de verdade — reaproveita a mesma função
+    // que já sabe zerar o saldo, mover pro Histórico se for o último item
+    // pendente, etc. (ela pega o próprio lock, por isso chamamos depois de
+    // já ter soltado o nosso lá em cima). Protegido com try/catch: se isso
+    // falhar por qualquer motivo, o e-mail já foi enviado de verdade e não
+    // tem como desfazer — melhor avisar que precisa resolver manualmente do
+    // que sumir com o erro e deixar o item preso pra sempre.
+    try {
+      const resultadoResolucao = processarBaixaSeparacao_({ id: id, responsavel: admNome, pagamentos: {}, semEstoque: [codigo], setorAtuante: setorAtuante });
+      return { sucesso: true, avisoEmail: resultadoEmail, resolucao: resultadoResolucao };
+    } catch (e) {
+      Logger.log("E-mail de Sem Estoque enviado, mas falhou ao resolver o item (código " + codigo + "): " + (e && e.message ? e.message : e));
+      return { sucesso: true, avisoEmail: resultadoEmail, resolucao: { status: "ERRO_AO_RESOLVER", mensagem: "O e-mail foi enviado, mas o item não pôde ser resolvido automaticamente: " + ((e && e.message) || String(e)) + ". Avise para verificar manualmente." } };
+    }
+  }
+
+  return { sucesso: true, avisoEmail: resultadoEmail };
+}
+
+// Reverte a marcação otimista de "aviso enviado" quando o MailApp acaba
+// falhando de verdade — assim o botão de disparo volta a ficar disponível.
+function desfazerAvisoEnviado_(id, codigo) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+  try {
+    const abaSol = getPlanilha().getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosAba = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosAba.length; i++) {
+      if (dadosAba[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) return;
+    const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+    const item = itens.find(it => it.codigo === codigo);
+    if (!item) return;
+    item.avisoEnviadoPor = "";
+    item.avisoEnviadoEm = "";
+    abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itens));
+
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Dados fictícios reaproveitados pelos testes de e-mail — pra não repetir em
+// cada função de teste.
+function dadosTesteEmail_() {
+  const dataHora = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+  return {
+    dadosSol: {
+      id: "999",
+      cliente: "CLIENTE TESTE",
+      pcp: "PCP TESTE",
+      logistica: "SOLICITANTE TESTE",
+      linhaProducao: "1",
+      dataHoraRegistro: dataHora,
+      dataCriacaoSolicitacao: dataHora
+    },
+    item: {
+      codigo: "00000",
+      op: "0000000",
+      tipo: "PCI",
+      qtd: 100,
+      saldoPendente: 100
+    }
+  };
+}
+
+/**
+ * FUNÇÃO DE TESTE — só o e-mail de DEPÓSITO QUALIDADE (Time Qualidade/IR). Rode
+ * ela direto aqui no editor (selecione "testarEnvioEmailDeposito0700" no
+ * menu de funções lá em cima e clique em Executar). Olhe o resultado em
+ * Ver > Registros de execução (Execution log) depois de rodar.
+ */
+function testarEnvioEmailDeposito0700() {
+  const { dadosSol, item } = dadosTesteEmail_();
+
+  Logger.log("========== TESTE: DEPÓSITO QUALIDADE (Time Qualidade / IR) ==========");
+  const email = obterEmailEquipe_("IR");
+  Logger.log("E-mail encontrado pra IR: " + (email || "(nenhum — preencha a coluna IR na aba " + NOME_ABA_EMAILS_EQUIPES + ")"));
+  if (!email) return;
+
+  const resultado = enviarAvisoEquipe_("DEPOSITO_0700", dadosSol, item, "TESTE");
+  Logger.log("Resultado: " + JSON.stringify(resultado));
+  Logger.log(resultado.enviado ? "✓ ENVIADO com sucesso pra: " + resultado.para : "✗ FALHOU: " + resultado.motivo);
+}
+
+/**
+ * FUNÇÃO DE TESTE — só o e-mail de SEM REQUISIÇÃO (Time PCP). Rode ela
+ * direto aqui no editor (selecione "testarEnvioEmailSemRequisicaoPCP" no
+ * menu de funções lá em cima e clique em Executar). Olhe o resultado em
+ * Ver > Registros de execução (Execution log) depois de rodar.
+ */
+function testarEnvioEmailSemRequisicaoPCP() {
+  const { dadosSol, item } = dadosTesteEmail_();
+
+  Logger.log("========== TESTE: SEM REQUISIÇÃO (Time PCP) ==========");
+  const email = obterEmailEquipe_("PCP");
+  Logger.log("E-mail encontrado pra PCP: " + (email || "(nenhum — preencha a coluna PCP na aba " + NOME_ABA_EMAILS_EQUIPES + ")"));
+  if (!email) return;
+
+  const resultado = enviarAvisoEquipe_("SEM_REQUISICAO", dadosSol, item, "TESTE", { qtdePendente: 100, resumoRolos: "Item 1: Lote L2305A, LOC A1, Qtd 100" });
+  Logger.log("Resultado: " + JSON.stringify(resultado));
+  Logger.log(resultado.enviado ? "✓ ENVIADO com sucesso pra: " + resultado.para : "✗ FALHOU: " + resultado.motivo);
+}
+
+/**
+ * FUNÇÃO DE TESTE — só o e-mail de SEM ESTOQUE (Time SMT). Rode ela direto
+ * aqui no editor (selecione "testarEnvioEmailSemEstoqueSMT" no menu de
+ * funções lá em cima e clique em Executar). Olhe o resultado em
+ * Ver > Registros de execução (Execution log) depois de rodar.
+ */
+function testarEnvioEmailSemEstoqueSMT() {
+  const { dadosSol, item } = dadosTesteEmail_();
+
+  Logger.log("========== TESTE: SEM ESTOQUE (Time SMT) ==========");
+  const email = obterEmailEquipe_("SMT");
+  Logger.log("E-mail encontrado pra SMT: " + (email || "(nenhum — preencha a coluna SMT na aba " + NOME_ABA_EMAILS_EQUIPES + ")"));
+  if (!email) return;
+
+  const resultado = enviarAvisoEquipe_("SEM_ESTOQUE", dadosSol, item, "TESTE");
+  Logger.log("Resultado: " + JSON.stringify(resultado));
+  Logger.log(resultado.enviado ? "✓ ENVIADO com sucesso pra: " + resultado.para : "✗ FALHOU: " + resultado.motivo);
+}
+
+/**
+ * FUNÇÃO DE TESTE — roda os 3 testes acima em sequência (Sem Estoque, Sem
+ * Requisição, Depósito Qualidade), pra checar tudo de uma vez. Selecione
+ * "testarEnvioEmail" no menu de funções e clique em Executar.
+ */
+function testarEnvioEmail() {
+  testarEnvioEmailSemEstoqueSMT();
+  Logger.log("");
+  testarEnvioEmailSemRequisicaoPCP();
+  Logger.log("");
+  testarEnvioEmailDeposito0700();
+  Logger.log("");
+  Logger.log("========== TESTES FINALIZADOS ==========");
+  Logger.log("Se algum aviso não foi enviado, verifique:");
+  Logger.log("1. A coluna SMT, PCP ou IR está preenchida na aba '" + NOME_ABA_EMAILS_EQUIPES + "'?");
+  Logger.log("2. Os e-mails estão válidos?");
+  Logger.log("3. Há algum erro de permissão do MailApp?");
+}
+
+/**
+ * Garante que valores de data venham sempre formatados como texto
+ * "dd/MM/yyyy HH:mm:ss", mesmo quando o Google Sheets armazenou a célula
+ * como um Date de verdade (o que acontece se o texto digitado/gravado
+ * "parecia" uma data e o Sheets converteu sozinho).
+ */
+function formatarDataCelula(valor) {
+  if (valor instanceof Date) {
+    return Utilities.formatDate(valor, getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+  }
+  return valor;
+}
+
+/**
+ * FUNÇÃO DE AUTORIZAÇÃO MANUAL
+ * ------------------------------------------------------------------
+ * Rode esta função UMA VEZ diretamente pelo editor do Apps Script para
+ * forçar a tela de permissões a aparecer (acesso à planilha, etc.).
+ *
+ * Como rodar:
+ * 1) No editor do Apps Script, no menu suspenso ao lado do botão "Executar"
+ *    (ou "Run"), selecione a função "autorizarAcesso".
+ * 2) Clique em "Executar" / "Run".
+ * 3) Vai aparecer uma tela pedindo permissão. Clique em "Revisar permissões",
+ *    escolha sua conta, clique em "Avançado" (se aparecer aviso de app não
+ *    verificado) e depois em "Acessar [nome do projeto] (não seguro)" e
+ *    "Permitir".
+ * 4) Confira no log (Ctrl+Enter ou "Ver registro de execução") se apareceu
+ *    "Autorização concluída com sucesso" com o nome da planilha.
+ * 5) Depois disso, o Web App volta a funcionar normalmente — não precisa
+ *    reimplantar de novo por causa disso.
+ */
+function autorizarAcesso() {
+  const planilha = getPlanilha();
+  const nome = planilha.getName();
+  const abas = planilha.getSheets().map(a => a.getName()).join(", ");
+  Logger.log("Autorização concluída com sucesso. Planilha: " + nome + " | Abas: " + abas);
+}
+
+/**
+ * FUNÇÃO DE RESET MANUAL DO CONTADOR DE SOLICITAÇÕES (PCI-1, PCI-2...)
+ * ------------------------------------------------------------------
+ * O número da solicitação é contado numa "Propriedade do Script" — uma
+ * memória interna do projeto, separada da planilha. Se você apagar as
+ * linhas da planilha esperando reiniciar a numeração do zero, ela sozinha
+ * NÃO reinicia, porque não sabe que os dados foram apagados.
+ *
+ * Rode esta função manualmente (Executar → escolha "resetarContadorSolicitacoes"
+ * no menu ao lado do botão Executar) toda vez que quiser reiniciar a
+ * numeração do zero — normalmente logo depois de limpar a planilha.
+ */
+function resetarContadorSolicitacoes() {
+  PropertiesService.getScriptProperties().deleteProperty("ULTIMO_ID_PCI");
+  Logger.log("Contador de solicitações reiniciado. A próxima solicitação criada será PCI-1 (a menos que já existam IDs na planilha — nesse caso, continua a partir do maior já encontrado).");
+}
+
+/**
+ * Renderiza a interface web — ou, se o link vier de um clique no botão de
+ * confirmação do e-mail (?confirmarAviso=1&...), mostra a página de
+ * confirmação em vez do sistema inteiro (ver
+ * processarConfirmacaoAvisoPorLink_).
+ */
+function doGet(e) {
+  iniciarPlanilha();
+  const params = (e && e.parameter) || {};
+  if (params.confirmarAviso === "1") {
+    return processarConfirmacaoAvisoPorLink_(params);
+  }
+  return HtmlService.createHtmlOutputFromFile('index')
+    .setTitle('Solicitação e Separação de PCI')
+    .setFaviconUrl('https://cdn-icons-png.flaticon.com/512/11894/11894938.png')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+// Monta uma paginazinha HTML simples e centralizada — usada só pelas telas de
+// confirmação/erro do botão de e-mail (processarConfirmacaoAvisoPorLink_),
+// não tem nada a ver com o sistema principal (index.html).
+function paginaSimples_(titulo, corpoHtml, cor) {
+  const corFundo = cor === "erro" ? "#fef2f2" : cor === "aviso" ? "#fffbeb" : "#f0fdf4";
+  const corBorda = cor === "erro" ? "#fecaca" : cor === "aviso" ? "#fde68a" : "#bbf7d0";
+  const corTitulo = cor === "erro" ? "#991b1b" : cor === "aviso" ? "#92400e" : "#065f46";
+  return HtmlService.createHtmlOutput(`
+    <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>body{font-family:Arial,Helvetica,sans-serif;background:#f8fafc;margin:0;padding:24px;display:flex;justify-content:center;}
+    .caixa{max-width:420px;width:100%;background:${corFundo};border:1px solid ${corBorda};border-radius:12px;padding:24px;text-align:center;}
+    h2{color:${corTitulo};margin:0 0 12px;font-size:18px;}
+    p{color:#374151;font-size:14px;line-height:1.5;}
+    select,input[type=text]{width:100%;padding:10px;margin:10px 0;border-radius:6px;border:1px solid #cbd5e1;font-size:14px;box-sizing:border-box;}
+    button{background:#059669;color:#fff;border:none;padding:12px 20px;border-radius:6px;font-weight:bold;font-size:14px;cursor:pointer;width:100%;}
+    </style></head><body><div class="caixa"><h2>${titulo}</h2>${corpoHtml}</div></body></html>
+  `).setTitle(titulo).addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/**
+ * Trata o clique no botão "Confirmar" que vai dentro do e-mail de Sem
+ * Requisição / Em Depósito Qualidade. Dois passos, os dois via GET (link
+ * simples, sem precisar de app nenhum):
+ * 1) Primeiro clique (sem &nome= ainda): valida a chave e mostra uma
+ *    telinha pedindo pra pessoa se identificar (lista de nomes cadastrados
+ *    daquele time, vinda de Nomes_Contatos + Emails_Equipes, ou "Outro").
+ * 2) Depois de escolher o nome e confirmar (form manda &nome=... de volta):
+ *    grava item.avisoConfirmado/avisoConfirmadoPor/avisoConfirmadoEm/
+ *    avisoConfirmadoEquipe, registra na timeline (tipoNota
+ *    "avisoConfirmado") e mostra a telinha de sucesso.
+ * A chave (avisoConfirmChave) é um UUID gerado só na hora do envio — sem
+ * ela batendo com a guardada no item, o link não confirma nada.
+ */
+function processarConfirmacaoAvisoPorLink_(params) {
+  const id = String(params.id || "").trim();
+  const codigo = String(params.codigo || "").trim();
+  const tipoAviso = String(params.tipo || "").trim();
+  const chave = String(params.chave || "").trim();
+  const nomeEscolhido = String(params.nome || "").trim();
+
+  if (!id || !codigo || !chave || ["SEM_REQUISICAO", "DEPOSITO_0700"].indexOf(tipoAviso) === -1) {
+    return paginaSimples_("Link inválido", "<p>Esse link está incompleto ou não é válido. Volte pro e-mail original e tente de novo.</p>", "erro");
+  }
+
+  const ss = getPlanilha();
+  const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+  const dadosAba = abaSol.getDataRange().getValues();
+  let linhaSol = -1;
+  for (let i = 1; i < dadosAba.length; i++) {
+    if (dadosAba[i][0] === id) { linhaSol = i + 1; break; }
+  }
+  if (linhaSol === -1) {
+    return paginaSimples_("Solicitação não encontrada", "<p>Essa solicitação não existe mais — provavelmente já foi finalizada.</p>", "aviso");
+  }
+
+  const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+  const item = itens.find(it => it.codigo === codigo);
+  if (!item || item.avisoConfirmChave !== chave) {
+    return paginaSimples_("Link inválido", "<p>Esse link não confere com o item mais atual dessa solicitação. Volte pro e-mail original.</p>", "erro");
+  }
+
+  if (item.avisoConfirmado) {
+    return paginaSimples_("Já confirmado", `<p>Esse aviso já tinha sido confirmado por <strong>${item.avisoConfirmadoPor}</strong>, em ${item.avisoConfirmadoEm}. Pode fechar essa aba.</p>`, "sucesso");
+  }
+
+  const rotuloTime = tipoAviso === "SEM_REQUISICAO" ? "PCP" : "IR";
+  const acaoRotulo = tipoAviso === "SEM_REQUISICAO" ? "a requisição foi aplicada" : "o material foi liberado";
+
+  const emailsEquipeStr = obterEmailEquipe_(rotuloTime) || "";
+  const emailsEquipe = emailsEquipeStr.split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+
+  // Detecta automaticamente quem está clicando — SÓ funciona quando o link
+  // veio da implantação com login obrigatório (URL_WEBAPP_COM_LOGIN); na
+  // implantação sem login, Session.getActiveUser() sempre volta vazio (e cai
+  // pro formulário manual mais abaixo, sem erro nenhum).
+  let emailDetectado = "";
+  try {
+    emailDetectado = String(Session.getActiveUser().getEmail() || "").trim().toLowerCase();
+  } catch (e) {
+    emailDetectado = "";
+  }
+  const nomeAutoDetectado = (emailDetectado && emailsEquipe.indexOf(emailDetectado) !== -1)
+    ? (obterNomeContato_(emailDetectado) || emailDetectado)
+    : null;
+
+  if (!nomeEscolhido) {
+    const url = `${URL_WEBAPP_COM_LOGIN || ScriptApp.getService().getUrl()}?confirmarAviso=1&id=${encodeURIComponent(id)}&codigo=${encodeURIComponent(codigo)}&tipo=${encodeURIComponent(tipoAviso)}&chave=${encodeURIComponent(chave)}`;
+
+    if (nomeAutoDetectado) {
+      // Já sabemos quem é (login detectado e bate com a equipe certa) — só
+      // pede uma confirmação de "é você mesmo?" antes de gravar, sem pedir
+      // pra digitar/selecionar nome nenhum.
+      return paginaSimples_(
+        "Confirmar que " + acaoRotulo,
+        `<p>Item <strong>${codigo}</strong> — identificamos você como <strong>${nomeAutoDetectado}</strong> (${emailDetectado}).</p>
+         <form method="GET" action="${url}">
+           <input type="hidden" name="confirmarAviso" value="1">
+           <input type="hidden" name="id" value="${id}">
+           <input type="hidden" name="codigo" value="${codigo}">
+           <input type="hidden" name="tipo" value="${tipoAviso}">
+           <input type="hidden" name="chave" value="${chave}">
+           <input type="hidden" name="nome" value="${nomeAutoDetectado.replace(/"/g, "&quot;")}">
+           <button type="submit">Sim, confirmar que ${acaoRotulo}</button>
+         </form>
+         <p style="font-size:11px;color:#9ca3af;margin-top:14px;">Só confirme depois de já ter feito a ação de verdade.</p>`,
+        "sucesso"
+      );
+    }
+
+    // Não deu pra identificar sozinho (link sem login, ou e-mail não
+    // cadastrado na equipe certa) — cai pro formulário manual de sempre.
+    const nomesConhecidos = emailsEquipe
+      .map(email => obterNomeContato_(email))
+      .filter(Boolean);
+    const opcoesHtml = nomesConhecidos.map(nome => `<option value="${nome.replace(/"/g, "&quot;")}">${nome}</option>`).join("");
+    return paginaSimples_(
+      "Confirmar que " + acaoRotulo,
+      `<p>Item <strong>${codigo}</strong> — confirme quem está registrando que ${acaoRotulo}:</p>
+       <form method="GET" action="${url}">
+         <input type="hidden" name="confirmarAviso" value="1">
+         <input type="hidden" name="id" value="${id}">
+         <input type="hidden" name="codigo" value="${codigo}">
+         <input type="hidden" name="tipo" value="${tipoAviso}">
+         <input type="hidden" name="chave" value="${chave}">
+         ${nomesConhecidos.length > 0 ? `<select name="nomeSelect" onchange="document.getElementById('nomeManual').value=this.value">
+           <option value="">— Selecione seu nome —</option>
+           ${opcoesHtml}
+           <option value="__outro__">Outro (digitar abaixo)</option>
+         </select>` : ""}
+         <input type="text" id="nomeManual" name="nome" placeholder="Digite seu nome completo" required>
+         <button type="submit">Confirmar</button>
+       </form>
+       <p style="font-size:11px;color:#9ca3af;margin-top:14px;">Só confirme depois de já ter feito a ação de verdade.</p>`,
+      "sucesso"
+    );
+  }
+
+  // 2º clique (form enviado) — grava de verdade.
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    return paginaSimples_("Sistema ocupado", "<p>O sistema está processando outra coisa agora. Espere alguns segundos e clique de novo no botão do e-mail.</p>", "aviso");
+  }
+  try {
+    const dadosAbaAtual = abaSol.getDataRange().getValues();
+    let linhaSolAtual = -1;
+    for (let i = 1; i < dadosAbaAtual.length; i++) {
+      if (dadosAbaAtual[i][0] === id) { linhaSolAtual = i + 1; break; }
+    }
+    if (linhaSolAtual === -1) {
+      return paginaSimples_("Solicitação não encontrada", "<p>Essa solicitação não existe mais.</p>", "aviso");
+    }
+    const itensAtual = JSON.parse(abaSol.getRange(linhaSolAtual, 6).getValue() || "[]");
+    const itemAtual = itensAtual.find(it => it.codigo === codigo);
+    if (!itemAtual || itemAtual.avisoConfirmChave !== chave) {
+      return paginaSimples_("Link inválido", "<p>Esse link não confere mais com o item atual dessa solicitação.</p>", "erro");
+    }
+    if (itemAtual.avisoConfirmado) {
+      return paginaSimples_("Já confirmado", `<p>Esse aviso já tinha sido confirmado por <strong>${itemAtual.avisoConfirmadoPor}</strong>, em ${itemAtual.avisoConfirmadoEm}.</p>`, "sucesso");
+    }
+
+    const agora = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+    itemAtual.avisoConfirmado = true;
+    itemAtual.avisoConfirmadoPor = nomeEscolhido.toUpperCase();
+    itemAtual.avisoConfirmadoEm = agora;
+    itemAtual.avisoConfirmadoEquipe = rotuloTime;
+    abaSol.getRange(linhaSolAtual, 6).setValue(JSON.stringify(itensAtual));
+
+    const historicoParcialAtual = JSON.parse(abaSol.getRange(linhaSolAtual, 7).getValue() || "[]");
+    historicoParcialAtual.push({
+      dataHora: agora,
+      responsavel: itemAtual.avisoConfirmadoPor,
+      apenasNota: true,
+      tipoNota: "avisoConfirmado",
+      itensPagos: [{
+        codigo: itemAtual.codigo,
+        op: itemAtual.op,
+        observacao: itemAtual.observacao,
+        equipe: rotuloTime
+      }]
+    });
+    abaSol.getRange(linhaSolAtual, 7).setValue(JSON.stringify(historicoParcialAtual));
+
+    const acaoConfirmadaTexto = tipoAviso === "SEM_REQUISICAO" ? "a requisição foi aplicada" : "o material foi liberado";
+    return paginaSimples_("Confirmado!", `<p>Registrado que <strong>${itemAtual.avisoConfirmadoPor}</strong> confirmou que ${acaoConfirmadaTexto}, às ${agora}.</p><p>Pode fechar essa aba.</p>`, "sucesso");
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/**
+ * Cria as abas necessárias automaticamente caso não existam
+ */
+function iniciarPlanilha() {
+  const ss = getPlanilha();
+
+  // Aba Solicitações
+  let abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+  if (!abaSol) {
+    abaSol = ss.insertSheet(NOME_ABA_SOLICITACOES);
+    abaSol.appendRow([
+      "ID_Solicitacao",
+      "Requisitante_PCP",
+      "Solicitante_Logistica",
+      "DataHora_Criacao",
+      "Status",
+      "Itens_JSON",
+      "Historico_Parcial_JSON",
+      "Separacao_Iniciada_Por",
+      "Separacao_Iniciada_Em",
+      "Linha_Producao",
+      "Urgente",
+      "Cliente",
+      "Setor"
+    ]);
+    abaSol.getRange(1, 1, 1, 13).setFontWeight("bold").setBackground("#1e3a8a").setFontColor("#ffffff");
+    abaSol.setFrozenRows(1);
+  } else {
+    if (abaSol.getLastColumn() < 9) {
+      // Migração: planilha já existente, só adiciona as colunas novas se ainda não tiver.
+      abaSol.getRange(1, 8, 1, 2).setValues([["Separacao_Iniciada_Por", "Separacao_Iniciada_Em"]]);
+      abaSol.getRange(1, 8, 1, 2).setFontWeight("bold").setBackground("#1e3a8a").setFontColor("#ffffff");
+    }
+    if (abaSol.getLastColumn() < 10) {
+      abaSol.getRange(1, 10).setValue("Linha_Producao");
+      abaSol.getRange(1, 10).setFontWeight("bold").setBackground("#1e3a8a").setFontColor("#ffffff");
+    }
+    if (abaSol.getLastColumn() < 11) {
+      abaSol.getRange(1, 11).setValue("Urgente");
+      abaSol.getRange(1, 11).setFontWeight("bold").setBackground("#1e3a8a").setFontColor("#ffffff");
+    }
+    if (abaSol.getLastColumn() < 12) {
+      abaSol.getRange(1, 12).setValue("Cliente");
+      abaSol.getRange(1, 12).setFontWeight("bold").setBackground("#1e3a8a").setFontColor("#ffffff");
+    }
+    if (abaSol.getLastColumn() < 13) {
+      abaSol.getRange(1, 13).setValue("Setor");
+      abaSol.getRange(1, 13).setFontWeight("bold").setBackground("#1e3a8a").setFontColor("#ffffff");
+    }
+  }
+
+  // Aba Histórico
+  let abaHist = ss.getSheetByName(NOME_ABA_HISTORICO);
+  if (!abaHist) {
+    abaHist = ss.insertSheet(NOME_ABA_HISTORICO);
+    abaHist.appendRow([
+      "ID_Solicitacao",
+      "Requisitante_PCP",
+      "Solicitante_Logistica",
+      "DataHora_Criacao",
+      "DataHora_Finalizacao",
+      "Tempo_Separacao_Minutos",
+      "Tempo_Separacao_Formatado",
+      "Itens_JSON",
+      "Detalhes_Pagamento_JSON",
+      "Linha_Producao",
+      "Urgente",
+      "Separacao_Iniciada_Por",
+      "Separacao_Iniciada_Em",
+      "Cliente",
+      "Setor"
+    ]);
+    abaHist.getRange(1, 1, 1, 15).setFontWeight("bold").setBackground("#065f46").setFontColor("#ffffff");
+    abaHist.setFrozenRows(1);
+  } else {
+    if (abaHist.getLastColumn() < 10) {
+      abaHist.getRange(1, 10).setValue("Linha_Producao");
+      abaHist.getRange(1, 10).setFontWeight("bold").setBackground("#065f46").setFontColor("#ffffff");
+    }
+    if (abaHist.getLastColumn() < 11) {
+      abaHist.getRange(1, 11).setValue("Urgente");
+      abaHist.getRange(1, 11).setFontWeight("bold").setBackground("#065f46").setFontColor("#ffffff");
+    }
+    if (abaHist.getLastColumn() < 13) {
+      abaHist.getRange(1, 12, 1, 2).setValues([["Separacao_Iniciada_Por", "Separacao_Iniciada_Em"]]);
+      abaHist.getRange(1, 12, 1, 2).setFontWeight("bold").setBackground("#065f46").setFontColor("#ffffff");
+    }
+    if (abaHist.getLastColumn() < 14) {
+      abaHist.getRange(1, 14).setValue("Cliente");
+      abaHist.getRange(1, 14).setFontWeight("bold").setBackground("#065f46").setFontColor("#ffffff");
+    }
+    if (abaHist.getLastColumn() < 15) {
+      abaHist.getRange(1, 15).setValue("Setor");
+      abaHist.getRange(1, 15).setFontWeight("bold").setBackground("#065f46").setFontColor("#ffffff");
+    }
+  }
+
+  // Aba de Sugestões (autocomplete de PCP, Logística, Código PCI e Responsável).
+  // A coluna "Tipo" só é usada nas linhas onde Campo = CODIGO: guarda o
+  // ÚLTIMO tipo (PCI / PASTA DE SOLDA) usado pra aquele código, pra
+  // servir de sugestão automática — o usuário sempre pode trocar na hora.
+  let abaSug = ss.getSheetByName(NOME_ABA_SUGESTOES);
+  if (!abaSug) {
+    abaSug = ss.insertSheet(NOME_ABA_SUGESTOES);
+    abaSug.appendRow(["Campo", "Valor", "Tipo"]);
+    abaSug.getRange(1, 1, 1, 3).setFontWeight("bold").setBackground("#4338ca").setFontColor("#ffffff");
+    abaSug.setFrozenRows(1);
+  } else if (abaSug.getLastColumn() < 3) {
+    abaSug.getRange(1, 3).setValue("Tipo");
+    abaSug.getRange(1, 3).setFontWeight("bold").setBackground("#4338ca").setFontColor("#ffffff");
+  }
+
+  // Aba de e-mails dos times que recebem os avisos automáticos (Sem
+  // Requisição → PCP, Sem Estoque → SMT, Em Depósito Qualidade → IR/Expedição).
+  // Cada COLUNA é um time (cabeçalho: SMT, PCP, IR) — o(s) e-mail(s) daquele
+  // time ficam listados um por linha, embaixo do cabeçalho. Pode adicionar
+  // quantas linhas de e-mail precisar. O sistema só lê essa planilha, nunca
+  // escreve nela.
+  const EQUIPES_EMAILS = ["SMT", "PCP", "LOGISTICA", "IR"];
+  const abaEmails = ss.getSheetByName(NOME_ABA_EMAILS_EQUIPES);
+  if (!abaEmails) {
+    const novaAba = ss.insertSheet(NOME_ABA_EMAILS_EQUIPES);
+    novaAba.appendRow(EQUIPES_EMAILS);
+    novaAba.getRange(1, 1, 1, EQUIPES_EMAILS.length).setFontWeight("bold").setBackground("#7c2d12").setFontColor("#ffffff");
+    novaAba.setFrozenRows(1);
+    for (let c = 1; c <= EQUIPES_EMAILS.length; c++) novaAba.setColumnWidth(c, 220);
+  } else {
+    const cabecalhoAtual = abaEmails.getLastColumn() > 0
+      ? abaEmails.getRange(1, 1, 1, abaEmails.getLastColumn()).getValues()[0].map(v => String(v).trim())
+      : [];
+    const jaEstaNoFormatoNovo = EQUIPES_EMAILS.every(nome => cabecalhoAtual.includes(nome)) && cabecalhoAtual[0] !== "Equipe";
+
+    if (!jaEstaNoFormatoNovo) {
+      // Migração: a aba estava num formato antigo (uma linha por equipe, com
+      // a coluna A = "Equipe"). Recolhe todos os e-mails que já tinham sido
+      // digitados em qualquer coluna daquela linha, e monta a planilha nova
+      // com uma coluna por time — sem perder nenhum e-mail já cadastrado.
+      const emailsColetados = {};
+      EQUIPES_EMAILS.forEach(nome => { emailsColetados[nome] = []; });
+
+      if (cabecalhoAtual[0] === "Equipe" && abaEmails.getLastRow() >= 2) {
+        const numColunasAntigas = abaEmails.getLastColumn();
+        const linhasAntigas = abaEmails.getRange(2, 1, abaEmails.getLastRow() - 1, numColunasAntigas).getValues();
+        linhasAntigas.forEach(linha => {
+          const nomeEquipe = String(linha[0]).trim().toUpperCase();
+          if (!emailsColetados[nomeEquipe]) return;
+          linha.slice(1).forEach(celula => {
+            String(celula || "").split(",").map(e => e.trim()).filter(Boolean).forEach(email => {
+              emailsColetados[nomeEquipe].push(email);
+            });
+          });
+        });
+      }
+
+      abaEmails.clear();
+      abaEmails.getRange(1, 1, 1, EQUIPES_EMAILS.length).setValues([EQUIPES_EMAILS]);
+      abaEmails.getRange(1, 1, 1, EQUIPES_EMAILS.length).setFontWeight("bold").setBackground("#7c2d12").setFontColor("#ffffff");
+      abaEmails.setFrozenRows(1);
+      for (let c = 1; c <= EQUIPES_EMAILS.length; c++) abaEmails.setColumnWidth(c, 220);
+
+      const maxLinhas = Math.max(1, ...EQUIPES_EMAILS.map(nome => emailsColetados[nome].length));
+      for (let l = 0; l < maxLinhas; l++) {
+        const linhaNova = EQUIPES_EMAILS.map(nome => emailsColetados[nome][l] || "");
+        abaEmails.getRange(l + 2, 1, 1, EQUIPES_EMAILS.length).setValues([linhaNova]);
+      }
+    }
+  }
+
+  // Aba "Nomes_Contatos" — cadastro manual de Nome Sobrenome por e-mail
+  // (PCP/IR), pra exibição sempre consistente quando o sistema detecta uma
+  // resposta. Cria a aba já com os e-mails de PCP/IR (lidos de
+  // Emails_Equipes) na coluna A e a coluna B em branco — preencher uma vez.
+  let abaNomes = ss.getSheetByName(NOME_ABA_NOMES_CONTATOS);
+  if (!abaNomes) {
+    abaNomes = ss.insertSheet(NOME_ABA_NOMES_CONTATOS);
+    abaNomes.appendRow(["E-mail", "Nome Sobrenome"]);
+    abaNomes.getRange(1, 1, 1, 2).setFontWeight("bold").setBackground("#7c2d12").setFontColor("#ffffff");
+    abaNomes.setFrozenRows(1);
+    abaNomes.setColumnWidth(1, 260);
+    abaNomes.setColumnWidth(2, 220);
+
+    const emailsPcpIr = [];
+    ["PCP", "IR"].forEach(function(equipe) {
+      const lista = obterEmailEquipe_(equipe);
+      if (lista) lista.split(",").map(e => e.trim()).filter(Boolean).forEach(e => emailsPcpIr.push(e));
+    });
+    const emailsUnicos = [...new Set(emailsPcpIr)];
+    if (emailsUnicos.length > 0) {
+      abaNomes.getRange(2, 1, emailsUnicos.length, 1).setValues(emailsUnicos.map(e => [e]));
+    }
+  }
+}
+
+// Retorna o Nome Sobrenome cadastrado manualmente na aba Nomes_Contatos pro
+// e-mail informado (ignora maiúsculo/minúsculo). Se não estiver cadastrado
+// (ou a coluna B estiver em branco), retorna null — quem chamou decide o
+// fallback (nome do cabeçalho do e-mail, ou o e-mail cru).
+function obterNomeContato_(email) {
+  if (!email) return null;
+  const ss = getPlanilha();
+  const aba = ss.getSheetByName(NOME_ABA_NOMES_CONTATOS);
+  if (!aba || aba.getLastRow() < 2) return null;
+  const dados = aba.getRange(2, 1, aba.getLastRow() - 1, 2).getValues();
+  const emailBusca = String(email).trim().toLowerCase();
+  for (const linha of dados) {
+    if (String(linha[0]).trim().toLowerCase() === emailBusca) {
+      const nome = String(linha[1] || "").trim();
+      return nome ? nome : null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Retorna todos os e-mails cadastrados por equipe na aba Emails_Equipes.
+ */
+function obterEmailsEquipes(dados) {
+  iniciarPlanilha();
+  const ss = getPlanilha();
+  let aba = ss.getSheetByName(NOME_ABA_EMAILS_EQUIPES);
+  if (!aba) {
+    garantirEstruturaAbas();
+    aba = ss.getSheetByName(NOME_ABA_EMAILS_EQUIPES);
+  }
+
+  const cabecalho = aba.getLastColumn() > 0
+    ? aba.getRange(1, 1, 1, aba.getLastColumn()).getValues()[0].map(v => String(v).trim().toUpperCase())
+    : [];
+
+  const equipesPadrao = ["SMT", "PCP", "LOGISTICA", "IR"];
+  const todasEquipes = [...new Set(equipesPadrao.concat(cabecalho.filter(Boolean)))];
+
+  // Garante que todas as colunas padrão existem no cabeçalho
+  let precisaAtualizarCabecalho = false;
+  equipesPadrao.forEach(eq => {
+    if (!cabecalho.includes(eq)) {
+      cabecalho.push(eq);
+      precisaAtualizarCabecalho = true;
+    }
+  });
+
+  if (precisaAtualizarCabecalho) {
+    aba.getRange(1, 1, 1, cabecalho.length).setValues([cabecalho]);
+    aba.getRange(1, 1, 1, cabecalho.length).setFontWeight("bold").setBackground("#7c2d12").setFontColor("#ffffff");
+    aba.setFrozenRows(1);
+    for (let c = 1; c <= cabecalho.length; c++) aba.setColumnWidth(c, 220);
+  }
+
+  const resultado = {};
+  const numLinhas = aba.getLastRow();
+
+  todasEquipes.forEach(eq => {
+    resultado[eq] = [];
+    const colIdx = cabecalho.indexOf(eq) + 1;
+    if (colIdx > 0 && numLinhas >= 2) {
+      const valores = aba.getRange(2, colIdx, numLinhas - 1, 1).getValues();
+      valores.forEach(l => {
+        const email = String(l[0] || "").trim();
+        if (email) resultado[eq].push(email);
+      });
+    }
+  });
+
+  return { sucesso: true, emailsPorEquipe: resultado, equipes: todasEquipes };
+}
+
+/**
+ * Salva a lista completa de e-mails das equipes na aba Emails_Equipes.
+ */
+function salvarEmailsEquipes(dados) {
+  const setorAtuante = String((dados && dados.setorAtuante) || "").trim();
+  const senha = String((dados && dados.senha) || "").trim();
+
+  if (setorAtuante !== "LOGISTICA_ADM" && senha !== "logisticaadm") {
+    throw new Error("Acesso negado: apenas o Administrador da Logística pode gerenciar os e-mails.");
+  }
+
+  const emailsPorEquipe = dados && dados.emailsPorEquipe;
+  if (!emailsPorEquipe || typeof emailsPorEquipe !== "object") {
+    throw new Error("Dados de e-mails inválidos.");
+  }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("a configuração de e-mails das equipes"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("a configuração de e-mails das equipes", "o Administrador da Logística");
+    iniciarPlanilha();
+    const ss = getPlanilha();
+    let aba = ss.getSheetByName(NOME_ABA_EMAILS_EQUIPES);
+    if (!aba) {
+      garantirEstruturaAbas();
+      aba = ss.getSheetByName(NOME_ABA_EMAILS_EQUIPES);
+    }
+
+    const equipesPadrao = ["SMT", "PCP", "LOGISTICA", "IR"];
+    const chavesRecebidas = Object.keys(emailsPorEquipe).map(k => String(k).trim().toUpperCase());
+    const equipesParaSalvar = [...new Set(equipesPadrao.concat(chavesRecebidas))];
+
+    aba.clear();
+    aba.getRange(1, 1, 1, equipesParaSalvar.length).setValues([equipesParaSalvar]);
+    aba.getRange(1, 1, 1, equipesParaSalvar.length).setFontWeight("bold").setBackground("#7c2d12").setFontColor("#ffffff");
+    aba.setFrozenRows(1);
+    for (let c = 1; c <= equipesParaSalvar.length; c++) aba.setColumnWidth(c, 220);
+
+    let maxLinhas = 0;
+    equipesParaSalvar.forEach(eq => {
+      const lista = Array.isArray(emailsPorEquipe[eq]) ? emailsPorEquipe[eq] : [];
+      if (lista.length > maxLinhas) maxLinhas = lista.length;
+    });
+
+    if (maxLinhas > 0) {
+      const matrizValores = [];
+      for (let l = 0; l < maxLinhas; l++) {
+        const linha = equipesParaSalvar.map(eq => {
+          const lista = Array.isArray(emailsPorEquipe[eq]) ? emailsPorEquipe[eq] : [];
+          return String(lista[l] || "").trim();
+        });
+        matrizValores.push(linha);
+      }
+      aba.getRange(2, 1, maxLinhas, equipesParaSalvar.length).setValues(matrizValores);
+    }
+
+    return { sucesso: true, mensagem: "Lista de e-mails atualizada com sucesso!" };
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Retorna as sugestões de autocomplete já conhecidas (PCP, Logística,
+ * Código PCI, Responsável), agrupadas por campo.
+ */
+function carregarSugestoesAutocomplete() {
+  try {
+    return JSON.stringify(carregarSugestoesAutocomplete_());
+  } catch (e) {
+    throw new Error("Falha ao carregar sugestões: " + (e && e.message ? e.message : e));
+  }
+}
+
+function carregarSugestoesAutocomplete_() {
+  iniciarPlanilha();
+  const ss = getPlanilha();
+  const aba = ss.getSheetByName(NOME_ABA_SUGESTOES);
+  const dados = aba.getLastRow() > 1 ? aba.getRange(2, 1, aba.getLastRow() - 1, 3).getValues() : [];
+
+  const resultado = { pcp: [], logistica: [], smt: [], codigo: [], responsavel: [], adm: [], linhaProducao: [], cliente: [], tipoPorCodigo: {} };
+  const mapaCampo = { PCP: "pcp", LOGISTICA: "logistica", SMT: "smt", CODIGO: "codigo", RESPONSAVEL: "responsavel", ADM: "adm", LINHA_PRODUCAO: "linhaProducao", CLIENTE: "cliente" };
+
+  dados.forEach(linha => {
+    const chave = mapaCampo[linha[0]];
+    if (chave && linha[1]) resultado[chave].push(String(linha[1]));
+    if (linha[0] === "CODIGO" && linha[1] && linha[2]) {
+      resultado.tipoPorCodigo[String(linha[1])] = String(linha[2]);
+    }
+  });
+
+  Object.keys(resultado).forEach(k => { if (Array.isArray(resultado[k])) resultado[k].sort(); });
+  return resultado;
+}
+
+/**
+ * Registra um valor novo (se ainda não existir) na aba de sugestões.
+ * Chamado automaticamente sempre que uma solicitação ou baixa é gravada —
+ * o usuário nunca precisa "salvar" a sugestão manualmente.
+ */
+function registrarSugestao_(campo, valor) {
+  valor = String(valor || "").trim();
+  if (!valor) return;
+
+  const ss = getPlanilha();
+  const aba = ss.getSheetByName(NOME_ABA_SUGESTOES);
+  const dados = aba.getLastRow() > 1 ? aba.getRange(2, 1, aba.getLastRow() - 1, 2).getValues() : [];
+
+  const jaExiste = dados.some(linha => linha[0] === campo && String(linha[1]).toUpperCase() === valor.toUpperCase());
+  if (!jaExiste) {
+    aba.appendRow([campo, valor]);
+  }
+}
+
+/**
+ * Registra um código PCI (se ainda não existir) e sempre ATUALIZA a coluna
+ * Tipo pro último tipo usado — diferente de registrarSugestao_, que só
+ * grava se o valor ainda não existir. Isso é o que faz o campo "Tipo" da
+ * Nova Solicitação vir pré-preenchido da próxima vez que alguém digitar
+ * esse mesmo código, mesmo que o tipo tenha mudado de solicitação pra outra.
+ */
+function registrarTipoCodigo_(codigo, tipo) {
+  codigo = String(codigo || "").trim();
+  tipo = String(tipo || "").trim().toUpperCase();
+  if (!codigo || !tipo) return;
+
+  const ss = getPlanilha();
+  const aba = ss.getSheetByName(NOME_ABA_SUGESTOES);
+  const ultimaLinha = aba.getLastRow();
+  const dados = ultimaLinha > 1 ? aba.getRange(2, 1, ultimaLinha - 1, 2).getValues() : [];
+
+  for (let i = 0; i < dados.length; i++) {
+    if (dados[i][0] === "CODIGO" && String(dados[i][1]).toUpperCase() === codigo.toUpperCase()) {
+      aba.getRange(i + 2, 3).setValue(tipo); // linha real na planilha = índice + 2 (cabeçalho + base 1)
+      return;
+    }
+  }
+  aba.appendRow(["CODIGO", codigo, tipo]);
+}
+
+/**
+ * Busca todos os dados para o Frontend (Pendentes e Histórico)
+ */
+function carregarDadosSistema() {
+  try {
+    // Retorna como STRING (JSON.stringify) em vez de objeto puro. Isso evita
+    // um bug conhecido do google.script.run: ao devolver um objeto com
+    // arrays de objetos aninhados, a serialização automática às vezes falha
+    // e devolve algo como "[Ljava.lang.Object;@hash" em vez dos dados reais.
+    // Uma string simples nunca sofre com esse bug.
+    return JSON.stringify(carregarDadosSistema_());
+  } catch (e) {
+    throw new Error("Falha ao ler a planilha: " + (e && e.message ? e.message : e));
+  }
+}
+
+function carregarDadosSistema_() {
+  iniciarPlanilha();
+  const ss = getPlanilha();
+
+  // Antes de montar a resposta, checa se algum item "Sem requisição" já foi
+  // baixado do outro lado (Requisição Manual) — se sim, resolve ele aqui
+  // também. E idem pra respostas de e-mail (PCP/IR) recebidas no Gmail.
+  //
+  // OTIMIZAÇÃO: as duas checagens são caras — a primeira abre uma planilha
+  // INTEIRA diferente por URL (Requisição Manual), a segunda varre o Gmail.
+  // Antes rodavam TODA VEZ que essa função era chamada — ou seja, a cada 25s
+  // enquanto qualquer pessoa tivesse a tela aberta (fora as chamadas do
+  // carregamento inicial e de "Atualizar" manual), o que deixava o
+  // carregamento bem mais lento do que precisava. Como já existe um gatilho
+  // automático rodando essas mesmas checagens sozinho de tempos em tempos
+  // (ver configurarVerificacaoRespostasAvisos e o gatilho de
+  // sincronizarBaixasSemRequisicaoAgendada), aqui só serve de reforço — não
+  // precisa rodar toda vez. Por isso agora só executa de fato no máximo 1
+  // vez a cada 3 minutos (usando o Cache do Script como "já rodei
+  // recentemente, pula"); todas as outras chamadas dentro dessa janela
+  // pulam direto pra leitura da planilha, que é rápida.
+  executarComLimiteDeFrequencia_("ultima_sinc_sem_requisicao", 180, sincronizarBaixasSemRequisicao_);
+  executarComLimiteDeFrequencia_("ultima_verif_respostas_avisos", 180, verificarRespostasAvisos_);
+
+  // OTIMIZAÇÃO: só lê as 10 baixas mais recentes do Histórico aqui (rápido),
+  // em vez da aba inteira (que só cresce com o tempo e ficava cada vez mais
+  // lenta pra decodificar). O restante é buscado depois, em segundo plano,
+  // pelo endpoint carregarHistoricoCompleto() — ver chamada equivalente no
+  // front-end logo depois do carregamento inicial. Ver montarResultadoCarregamento_.
+  return montarResultadoCarregamento_(ss, 10);
+}
+
+/**
+ * Salva uma nova solicitação vinda do Frontend
+ */
+function salvarNovaSolicitacao(dados) {
+  const validado = validarPayloadSolicitacao(dados);
+  if (!validado.ok) {
+    throw new Error(validado.erro);
+  }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("uma nova solicitação"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("uma nova solicitação", validado.dados.logistica);
+    const ss = getPlanilha();
+    const aba = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+
+    const id = gerarIdSolicitacao();
+    const dataAtual = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+
+    aba.appendRow([
+      id,
+      validado.dados.pcp,
+      validado.dados.logistica,
+      dataAtual,
+      "PENDENTE",
+      JSON.stringify(validado.dados.itens),
+      JSON.stringify([]),
+      "",
+      "",
+      validado.dados.linhaProducao,
+      validado.dados.urgente ? "SIM" : "",
+      validado.dados.cliente,
+      validado.dados.setor
+    ]);
+
+    registrarSugestao_("PCP", validado.dados.pcp);
+    // Guarda o nome do solicitante no Campo certo (LOGISTICA ou SMT) conforme
+    // o setor de quem enviou — assim o autocomplete de cada setor só sugere
+    // nomes de quem já solicitou por aquele mesmo setor.
+    registrarSugestao_(validado.dados.setor, validado.dados.logistica);
+    registrarSugestao_("LINHA_PRODUCAO", validado.dados.linhaProducao);
+    registrarSugestao_("CLIENTE", validado.dados.cliente);
+    validado.dados.itens.forEach(it => registrarTipoCodigo_(it.codigo, it.tipo));
+
+    return { sucesso: true, id: id };
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+// Abre a aba "lista" da planilha do sistema Requisição Manual (outro
+// projeto Apps Script, outra planilha) — usado tanto por
+// iniciarSemRequisicaoItem quanto por sincronizarBaixasSemRequisicao_.
+function obterSheetRequisicaoManual_() {
+  const ss = SpreadsheetApp.openByUrl(PLANILHA_REQUISICAO_MANUAL_URL);
+  const sheet = ss.getSheetByName(ABA_REQUISICAO_MANUAL);
+  if (!sheet) {
+    throw new Error('Aba "' + ABA_REQUISICAO_MANUAL + '" não encontrada na planilha do Requisição Manual.');
+  }
+  return sheet;
+}
+
+// Direção INVERSA da sincronização: quando um item "Sem requisição" acaba
+// sendo resolvido por AQUI (alguém grava uma OT de verdade por cima, em vez
+// de esperar a baixa lá no Requisição Manual), avisa a outra planilha
+// gravando a baixa nas linhas correspondentes — senão elas ficariam
+// pendentes por lá pra sempre, mesmo já resolvidas aqui.
+function marcarBaixaNoRequisicaoManual_(linhas, codigo, responsavel) {
+  const linhasArray = Array.isArray(linhas) ? linhas : (linhas ? [linhas] : []);
+  if (linhasArray.length === 0) return;
+
+  try {
+    const sheet = obterSheetRequisicaoManual_();
+    const ultimaLinha = sheet.getLastRow();
+    const agora = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+
+    linhasArray.forEach(function(linhaNum) {
+      if (!linhaNum || linhaNum > ultimaLinha) return;
+      const codigoNaLinha = String(sheet.getRange(linhaNum, 1).getValue() || "").trim();
+      if (codigoNaLinha !== String(codigo).trim()) return; // linha foi apagada/movida — não mexe
+      const respBaixaAtual = String(sheet.getRange(linhaNum, 7).getValue() || "").trim();
+      if (respBaixaAtual) return; // já tinha baixa gravada lá — não sobrescreve
+      // F: DATA/HORA BAIXA | G: RESP. BAIXA
+      sheet.getRange(linhaNum, 6, 1, 2).setValues([[agora, (responsavel || "").toUpperCase() + " (via sistema PCI)"]]);
+    });
+  } catch (e) {
+    // Não trava a gravação da OT por aqui se a outra planilha falhar (ex: fora
+    // do ar, sem permissão) — só registra no log pra investigar depois.
+    Logger.log("Falha ao marcar baixa no Requisição Manual (código " + codigo + "): " + (e && e.message ? e.message : e));
+  }
+}
+
+/**
+ * Classifica UM item como "Sem requisição", a partir do modal de separação —
+ * aberto a qualquer um da Logística (não só ADM). Diferente do fluxo antigo,
+ * essa função NÃO grava nada ainda no Requisição Manual:
+ * 1) guarda os dados de lote(s)/rolo(s) digitados dentro do próprio item
+ *    (item.rolosSemRequisicao), e marca o item aqui no sistema-pci com a
+ *    observação "[SEM REQUISIÇÃO]" — o item CONTINUA pendente na fila daqui;
+ * 2) só quando o ADM confirmar e disparar o e-mail pro PCP (ver
+ *    dispararAvisoEquipeAdm) é que as linhas de verdade entram no
+ *    Requisição Manual (uma por rolo/lote) — é aí que item.semRequisicaoLinha
+ *    passa a existir, guardando a lista de linhas gravadas lá;
+ * 3) sincronizarBaixasSemRequisicao_() (chamada a cada carregarDadosSistema)
+ *    fica de olho em TODAS essas linhas (só depois de existirem): só quando
+ *    TODOS os rolos daquele item já tiverem sido baixados por lá (coluna
+ *    RESP. BAIXA preenchida em cada um), o item some daqui sozinho — sem
+ *    precisar de nenhuma ação aqui no sistema-pci.
+ *
+ * Colunas da planilha "lista" (nessa ordem, preenchidas só na confirmação):
+ * A: CODIGO | B: QUANTIDADE | C: LOTE | D: SOLIC POR | E: RESP. ENTREGA
+ * F: DATA/HORA BAIXA (vazio) | G: RESP. BAIXA (vazio) | H: DATA HORA ENTREGA
+ * I: QUANTO ITEM | J: TIPO | K: Nº DA OP | L: LOC | M: LINHA
+ *
+ * @param {Object} dados - { id, codigo, op, tipo, rolos: [{lote, loc, quantidade}], logistica, linhaProducao, setor, responsavel }
+ */
+function iniciarSemRequisicaoItem(dados) {
+  const id = String((dados && dados.id) || "").trim();
+  const codigo = String((dados && dados.codigo) || "").trim();
+  const tipo = String((dados && dados.tipo) || "").trim().toUpperCase();
+  const op = String((dados && dados.op) || "").trim();
+  const logistica = String((dados && dados.logistica) || "").trim();
+  const linhaProducao = String((dados && dados.linhaProducao) || "").trim().toUpperCase();
+  const responsavel = String((dados && dados.responsavel) || "").trim();
+  const rolosBrutos = Array.isArray(dados && dados.rolos) ? dados.rolos : [];
+  const setorAtuante = String((dados && dados.setorAtuante) || "").trim();
+
+  if (setorAtuante !== "LOGISTICA_ADM" && setorAtuante !== "LOGISTICA") {
+    throw new Error("Só quem está no setor Logística pode classificar um item como Sem Requisição.");
+  }
+  if (!id) throw new Error("ID da solicitação não informado.");
+  if (!codigo) throw new Error('Item "sem requisição" precisa de um código.');
+  if (!TIPOS_ITEM_VALIDOS.includes(tipo)) throw new Error(`Tipo inválido para o código ${codigo}.`);
+  if (!logistica) throw new Error("Solicitante não informado.");
+  if (!linhaProducao) throw new Error("Linha de Produção não informada.");
+  if (!responsavel) throw new Error("Responsável pela Separação não informado.");
+  if (rolosBrutos.length === 0) throw new Error("Adicione ao menos um lote/rolo.");
+
+  const rolos = rolosBrutos.map(function(r, i) {
+    const lote = String((r && r.lote) || "").trim().toUpperCase();
+    const loc = String((r && r.loc) || "").trim().toUpperCase();
+    const quantidade = Number((r && r.quantidade) || 0);
+    if (!lote) throw new Error(`Informe o Lote do rolo ${i + 1} (código ${codigo}).`);
+    if (!loc) throw new Error(`Informe o LOC do rolo ${i + 1} (código ${codigo}).`);
+    if (!quantidade || isNaN(quantidade) || quantidade <= 0) throw new Error(`Informe a Quantidade do rolo ${i + 1} (código ${codigo}).`);
+    return { lote: lote, loc: loc, quantidade: quantidade };
+  });
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("uma classificação Sem Requisição"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("uma classificação Sem Requisição", responsavel);
+    // Só GUARDA os dados do(s) lote(s)/rolo(s) aqui — a gravação de verdade na
+    // planilha do Requisição Manual (e o envio do e-mail pro PCP) só acontece
+    // quando o ADM confirmar depois (ver dispararAvisoEquipeAdm), pra dar
+    // chance dele conferir se está certo antes de "oficializar". Até lá, o
+    // item já aparece pendente aqui no sistema com o marcador [SEM
+    // REQUISIÇÃO], só não existe ainda do lado do Requisição Manual.
+    registrarTipoCodigo_(codigo, tipo);
+    registrarSugestao_(setorAtualOuPadrao_(dados), logistica);
+    registrarSugestao_("LINHA_PRODUCAO", linhaProducao);
+
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosAba = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosAba.length; i++) {
+      if (dadosAba[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) {
+      throw new Error("Esta solicitação não foi encontrada — provavelmente já foi finalizada. Atualize a tela.");
+    }
+
+    const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+    const item = itens.find(it => it.codigo === codigo);
+    if (!item) throw new Error(`Item com código ${codigo} não encontrado nesta solicitação.`);
+
+    // Se o ADM já confirmou esse item antes (já existem linhas de verdade no
+    // Requisição Manual), não deixa reclassificar por cima — isso deixaria
+    // aquelas linhas órfãs por lá (o vínculo seria apagado) e, se o ADM
+    // confirmasse de novo, criaria linhas duplicadas. Quem precisar corrigir
+    // um item já confirmado deve resolver com uma OT de verdade
+    // (salvarOtItem já sabe marcar a baixa nas linhas existentes e soltar o
+    // vínculo direitinho), não reclassificando de novo por aqui.
+    if (item.semRequisicaoLinha && item.semRequisicaoLinha.length > 0) {
+      throw new Error(`Esse item já foi confirmado pelo ADM e já tem registro no Requisição Manual — não dá pra reclassificar por cima. Se precisar corrigir, informe uma OT de verdade pra esse item em vez de marcar "Sem Requisição" de novo.`);
+    }
+
+    // Confirmação de entrega (foto + assinatura de quem recebeu o material) —
+    // AGORA É SEMPRE OBRIGATÓRIA ao classificar um item como Sem Requisição,
+    // independente do setor: o material está saindo fisicamente agora mesmo,
+    // sem OT/requisição, e é nesse exato momento — com quem está entregando
+    // presente — que precisa ficar registrado quem recebeu. O front-end já
+    // abre o wizard de foto→assinatura→nome antes de chamar aqui, mas valida
+    // de novo no backend por segurança.
+    // Depois disso o item fica pendente até alguém informar a OT de verdade
+    // (ver salvarOtItem) — nesse passo posterior NÃO se pede foto/assinatura
+    // de novo, já que a entrega física já aconteceu aqui.
+    const liderNomeEntrega = String((dados && dados.liderNome) || "").trim();
+    if (!dados.fotoUrl && !dados.fotoBase64) {
+      throw new Error("A foto de referência da entrega é obrigatória para classificar um item como Sem Requisição.");
+    }
+    if (!dados.assinaturaUrl && !dados.assinaturaBase64) {
+      throw new Error("A assinatura de quem recebeu o material é obrigatória para classificar um item como Sem Requisição.");
+    }
+    if (!liderNomeEntrega) {
+      throw new Error("Informe o nome de quem recebeu o material e está assinando.");
+    }
+    const idBaseSemReq = String(id).replace(/[^a-zA-Z0-9\-]/g, "");
+    const carimboBaseSemReq = Utilities.formatDate(new Date(), getFusoHorario(), "yyyyMMdd-HHmmss");
+    const fotoUrlEntrega = dados.fotoUrl || salvarImagemBase64NoDrive_(dados.fotoBase64, `${idBaseSemReq}_semreq_foto_${carimboBaseSemReq}`);
+    const assinaturaUrlEntrega = dados.assinaturaUrl || salvarImagemBase64NoDrive_(dados.assinaturaBase64, `${idBaseSemReq}_semreq_assinatura_${carimboBaseSemReq}`);
+    registrarSugestao_("SMT", liderNomeEntrega);
+
+    const dataHoraEntrega = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+
+    // O nome de cada "unidade" varia por Tipo: SMD é vendido/armazenado em
+    // rolo, PASTA DE SOLDA em pote, PCI por item — cada um com seu jargão.
+    const nomeUnidade = tipo === "SMD" ? "Rolo" : (tipo === "PASTA DE SOLDA" ? "Pote" : (tipo === "PCI" ? "Item" : "Item"));
+    const resumoRolos = rolos.map(function(r, i) {
+      return `${nomeUnidade} ${i + 1}: Lote ${r.lote}${r.loc ? ", LOC " + r.loc : ""}, Qtd ${r.quantidade}`;
+    }).join(" · ");
+    const observacao = `[SEM REQUISIÇÃO] Resp. Entrega ${responsavel.toUpperCase()} · ${resumoRolos}`;
+
+    item.observacao = observacao;
+    item.ot = "";
+    item.qtdPretendida = 0;
+    item.responsavelRodada = responsavel;
+    item.dataHoraResponsavelRodada = dataHoraEntrega;
+    // Foto/assinatura/líder da entrega física (quando exigidos) ficam
+    // guardados no próprio item, pra não precisar pedir de novo se um dia
+    // esse fluxo passar a reaproveitar na baixa final.
+    if (fotoUrlEntrega) item.fotoSemRequisicaoUrl = fotoUrlEntrega;
+    if (assinaturaUrlEntrega) item.assinaturaSemRequisicaoUrl = assinaturaUrlEntrega;
+    if (liderNomeEntrega) item.liderNomeSemRequisicao = liderNomeEntrega;
+    // Guarda os rolos crus (lote/loc/quantidade) pro ADM usar quando
+    // confirmar — é só nesse momento que viram linhas de verdade no
+    // Requisição Manual.
+    item.rolosSemRequisicao = rolos;
+    delete item.semRequisicaoLinha; // se estava reclassificando de novo, limpa o link antigo
+    abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itens));
+    registrarSugestao_("RESPONSAVEL", responsavel.toUpperCase());
+
+    const separacaoJaIniciada = abaSol.getRange(linhaSol, 8).getValue();
+    if (!separacaoJaIniciada) {
+      abaSol.getRange(linhaSol, 8, 1, 2).setValues([[responsavel, dataHoraEntrega]]);
+    }
+
+    // Grava uma nota na linha do tempo — antes essa ação não deixava
+    // nenhum registro visível ali, fazendo parecer que "sumiu" quem
+    // realmente classificou o item como Sem Requisição.
+    const historicoParcialAtual = JSON.parse(abaSol.getRange(linhaSol, 7).getValue() || "[]");
+    historicoParcialAtual.push({
+      dataHora: dataHoraEntrega,
+      responsavel: responsavel,
+      apenasNota: true,
+      tipoNota: "informou",
+      fotoUrl: fotoUrlEntrega,
+      assinaturaUrl: assinaturaUrlEntrega,
+      liderNome: liderNomeEntrega,
+      itensPagos: [{ codigo: item.codigo, op: item.op, ot: "", observacao: observacao, qtdPaga: 0, saldoRestante: Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd) }]
+    });
+    abaSol.getRange(linhaSol, 7).setValue(JSON.stringify(historicoParcialAtual));
+
+    return { sucesso: true, observacao: observacao };
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Marca um item como "Em Depósito Qualidade" — NÃO resolve o item (fica pendente
+ * do mesmo jeito, esperando alguém informar a OT depois), só grava a
+ * observação com o marcador, avisa o time do IR/Expedição por e-mail, e
+ * registra uma nota na linha do tempo. Só o ADM da Logística pode chamar.
+ */
+function marcarDeposito0700Item(dados) {
+  const id = String((dados && dados.id) || "").trim();
+  const codigo = String((dados && dados.codigo) || "").trim();
+  const responsavel = String((dados && dados.responsavel) || "").trim();
+  const setorAtuante = String((dados && dados.setorAtuante) || "").trim();
+
+  if (setorAtuante !== "LOGISTICA_ADM" && setorAtuante !== "LOGISTICA") {
+    throw new Error("Só quem está no setor Logística pode classificar um item como Em Depósito Qualidade.");
+  }
+  if (!id) throw new Error("ID da solicitação não informado.");
+  if (!codigo) throw new Error("Código do item não informado.");
+  if (!responsavel) throw new Error("Responsável pela Separação não informado.");
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("uma classificação Em Depósito Qualidade"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("uma classificação Em Depósito Qualidade", responsavel);
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosAba = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosAba.length; i++) {
+      if (dadosAba[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) {
+      throw new Error("Esta solicitação não foi encontrada — provavelmente já foi finalizada. Atualize a tela.");
+    }
+
+    const linhaCompleta = dadosAba[linhaSol - 1];
+    const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+    const item = itens.find(it => it.codigo === codigo);
+    if (!item) throw new Error(`Item com código ${codigo} não encontrado nesta solicitação.`);
+
+    const agora = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+    const observacao = `[EM DEPÓSITO QUALIDADE] Informado por ${responsavel.toUpperCase()} em ${agora}`;
+
+    item.observacao = observacao;
+    item.ot = "";
+    item.responsavelRodada = responsavel;
+    item.dataHoraResponsavelRodada = agora;
+    item.dataHoraQualidade = agora;
+    item.responsavelQualidade = responsavel.toUpperCase();
+    abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itens));
+    registrarSugestao_("RESPONSAVEL", responsavel.toUpperCase());
+
+
+    // Grava uma nota na linha do tempo, mesmo mecanismo que "Sem OT" usa pra
+    // aparecer no histórico de movimentações.
+    const historicoParcialAtual = JSON.parse(abaSol.getRange(linhaSol, 7).getValue() || "[]");
+    historicoParcialAtual.push({
+      dataHora: agora,
+      responsavel: responsavel,
+      apenasNota: true,
+      tipoNota: "informou",
+      itensPagos: [{
+        codigo: item.codigo,
+        op: item.op,
+        ot: "",
+        observacao: observacao,
+        dataHoraQualidade: agora,
+        responsavelQualidade: responsavel.toUpperCase(),
+        qtdPaga: 0,
+        saldoRestante: Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd)
+      }]
+    });
+    abaSol.getRange(linhaSol, 7).setValue(JSON.stringify(historicoParcialAtual));
+
+    const separacaoJaIniciada = abaSol.getRange(linhaSol, 8).getValue();
+    if (!separacaoJaIniciada) {
+      abaSol.getRange(linhaSol, 8, 1, 2).setValues([[responsavel, agora]]);
+    }
+
+    return { sucesso: true, observacao: observacao };
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Marca um item como "Sem Estoque" — NÃO resolve o item na hora (fica
+ * pendente, saldo intocado), só grava a observação com o marcador e registra
+ * uma nota na linha do tempo. O item só é resolvido de verdade (saldo
+ * zerado, some das pendências) quando o ADM disparar o e-mail pro SMT
+ * (ver dispararAvisoEquipeAdm) — antes disso fica igual "Em Depósito
+ * Qualidade": pendente, esperando confirmação.
+ */
+function marcarSemEstoqueItem(dados) {
+  const id = String((dados && dados.id) || "").trim();
+  const codigo = String((dados && dados.codigo) || "").trim();
+  const responsavel = String((dados && dados.responsavel) || "").trim();
+  const setorAtuante = String((dados && dados.setorAtuante) || "").trim();
+
+  if (setorAtuante !== "LOGISTICA_ADM" && setorAtuante !== "LOGISTICA") {
+    throw new Error("Só quem está no setor Logística pode classificar um item como Sem Estoque.");
+  }
+  if (!id) throw new Error("ID da solicitação não informado.");
+  if (!codigo) throw new Error("Código do item não informado.");
+  if (!responsavel) throw new Error("Responsável pela Separação não informado.");
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("uma classificação Sem Estoque"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("uma classificação Sem Estoque", responsavel);
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosAba = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosAba.length; i++) {
+      if (dadosAba[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) {
+      throw new Error("Esta solicitação não foi encontrada — provavelmente já foi finalizada. Atualize a tela.");
+    }
+
+    const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+    const item = itens.find(it => it.codigo === codigo);
+    if (!item) throw new Error(`Item com código ${codigo} não encontrado nesta solicitação.`);
+
+    const agora = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+    const observacao = `[SEM ESTOQUE] Informado por ${responsavel.toUpperCase()} em ${agora}`;
+
+    item.observacao = observacao;
+    item.ot = "";
+    item.responsavelRodada = responsavel;
+    item.dataHoraResponsavelRodada = agora;
+    item.dataHoraSemEstoque = agora;
+    item.responsavelSemEstoque = responsavel.toUpperCase();
+    abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itens));
+    registrarSugestao_("RESPONSAVEL", responsavel.toUpperCase());
+
+
+    const historicoParcialAtual = JSON.parse(abaSol.getRange(linhaSol, 7).getValue() || "[]");
+    historicoParcialAtual.push({
+      dataHora: agora,
+      responsavel: responsavel,
+      apenasNota: true,
+      tipoNota: "informou",
+      itensPagos: [{
+        codigo: item.codigo,
+        op: item.op,
+        ot: "",
+        observacao: observacao,
+        dataHoraSemEstoque: agora,
+        responsavelSemEstoque: responsavel.toUpperCase(),
+        qtdPaga: 0,
+        saldoRestante: Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd)
+      }]
+    });
+    abaSol.getRange(linhaSol, 7).setValue(JSON.stringify(historicoParcialAtual));
+
+    const separacaoJaIniciada2 = abaSol.getRange(linhaSol, 8).getValue();
+    if (!separacaoJaIniciada2) {
+      abaSol.getRange(linhaSol, 8, 1, 2).setValues([[responsavel, agora]]);
+    }
+
+    return { sucesso: true, observacao: observacao };
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Edita o Nº OP ou a Qtd. Solicitada de um item direto na planilha — só o
+ * ADM da Logística pode chamar. Grava a alteração (valor antigo → novo +
+ * motivo + responsável + data/hora) como uma nota na linha do tempo da
+ * solicitação, igual as outras movimentações. Editar a Qtd. Solicitada
+ * recalcula o saldo pendente (novaQtd - já pago), sem deixar zerar/negativar
+ * abaixo do que já foi pago.
+ */
+function editarCampoItemAdm(dados) {
+  const id = String((dados && dados.id) || "").trim();
+  const codigo = String((dados && dados.codigo) || "").trim();
+  const campo = String((dados && dados.campo) || "").trim();
+  const valorNovoBruto = String((dados && dados.valorNovo) || "").trim();
+  const motivo = String((dados && dados.motivo) || "").trim();
+  const responsavel = String((dados && dados.responsavel) || "").trim();
+  const setorAtuante = String((dados && dados.setorAtuante) || "").trim();
+
+  if (setorAtuante !== "LOGISTICA_ADM") {
+    throw new Error("Só assistentes/técnicos podem editar esse campo.");
+  }
+  if (!id) throw new Error("ID da solicitação não informado.");
+  if (!codigo) throw new Error("Código do item não informado.");
+  if (campo !== "op" && campo !== "qtd") throw new Error("Campo inválido.");
+  if (!valorNovoBruto) throw new Error("Informe o novo valor.");
+  if (!motivo) throw new Error("Informe o motivo da alteração.");
+  if (!responsavel) throw new Error("Responsável pela Separação não informado.");
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("uma edição de item"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("uma edição de item", responsavel);
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosAba = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosAba.length; i++) {
+      if (dadosAba[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) {
+      throw new Error("Esta solicitação não foi encontrada — provavelmente já foi finalizada. Atualize a tela.");
+    }
+
+    const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+    const item = itens.find(it => it.codigo === codigo);
+    if (!item) throw new Error(`Item com código ${codigo} não encontrado nesta solicitação.`);
+
+    let valorAntigo, valorNovoFinal, campoEditadoRotulo, saldoPendenteResultante;
+
+    if (campo === "op") {
+      valorAntigo = item.op;
+      valorNovoFinal = valorNovoBruto.toUpperCase();
+      campoEditadoRotulo = "Nº OP";
+      item.op = valorNovoFinal;
+      saldoPendenteResultante = item.saldoPendente !== undefined ? item.saldoPendente : item.qtd;
+    } else {
+      const novaQtd = Number(valorNovoBruto);
+      if (!novaQtd || isNaN(novaQtd) || novaQtd <= 0) throw new Error("Quantidade inválida.");
+      const qtdJaPaga = Number(item.qtdPagaTotal || 0);
+      if (novaQtd < qtdJaPaga) {
+        throw new Error(`Não é possível definir uma quantidade menor do que já foi pago (${qtdJaPaga}).`);
+      }
+      valorAntigo = item.qtd;
+      valorNovoFinal = novaQtd;
+      campoEditadoRotulo = "Qtd. Solicitada";
+      item.qtd = novaQtd;
+      item.saldoPendente = novaQtd - qtdJaPaga;
+      saldoPendenteResultante = item.saldoPendente;
+    }
+
+    abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itens));
+    registrarSugestao_("ADM", responsavel.toUpperCase());
+    registrarSugestao_("RESPONSAVEL", responsavel.toUpperCase());
+
+    // Grava a movimentação na linha do tempo, igual as outras ações.
+    const agora = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+    const historicoParcialAtual = JSON.parse(abaSol.getRange(linhaSol, 7).getValue() || "[]");
+    historicoParcialAtual.push({
+      dataHora: agora,
+      responsavel: responsavel,
+      apenasNota: true,
+      tipoNota: "edicaoCampo",
+      itensPagos: [{
+        codigo: item.codigo,
+        op: item.op,
+        ot: item.ot || "",
+        campoEditado: campoEditadoRotulo,
+        valorAntigo: String(valorAntigo),
+        valorNovo: String(valorNovoFinal),
+        motivo: motivo,
+        qtdPaga: 0,
+        saldoRestante: Number(saldoPendenteResultante)
+      }]
+    });
+    abaSol.getRange(linhaSol, 7).setValue(JSON.stringify(historicoParcialAtual));
+
+    return { sucesso: true, valorNovo: valorNovoFinal, saldoPendente: saldoPendenteResultante };
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Cancela uma solicitação inteira a pedido do ADM da Logística.
+ * Registra o motivo obrigatório nas movimentações (linha do tempo) e move a
+ * solicitação diretamente de Solicitacoes_PCI para Historico_PCI com status
+ * CANCELADO, liberando a fila de separação.
+ */
+function cancelarSolicitacaoAdm(dados) {
+  const id = String((dados && dados.id) || "").trim();
+  const motivo = String((dados && dados.motivo) || "").trim();
+  const responsavel = String((dados && dados.responsavel) || "").trim();
+  const setorAtuante = String((dados && dados.setorAtuante) || "").trim();
+
+  if (setorAtuante !== "LOGISTICA_ADM") {
+    throw new Error("Apenas assistentes/técnicos (Logística ADM) podem cancelar esta solicitação.");
+  }
+  if (!id) throw new Error("ID da solicitação não informado.");
+  if (!motivo) throw new Error("Informe o motivo do cancelamento.");
+  if (!responsavel) throw new Error("Informe o nome do responsável ADM que está cancelando.");
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("um cancelamento de solicitação"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("um cancelamento de solicitação", responsavel);
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const abaHist = ss.getSheetByName(NOME_ABA_HISTORICO);
+
+    registrarSugestao_("ADM", responsavel.toUpperCase());
+    registrarSugestao_("RESPONSAVEL", responsavel.toUpperCase());
+
+    const dadosSol = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosSol.length; i++) {
+      if (dadosSol[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) {
+      throw new Error("Esta solicitação não foi encontrada — provavelmente já foi finalizada ou cancelada. Atualize a tela.");
+    }
+
+    const valoresSol = abaSol.getRange(linhaSol, 1, 1, 13).getValues()[0];
+
+    const pcp = valoresSol[1];
+    const logistica = valoresSol[2];
+    const dataCriacaoStr = formatarDataCelula(valoresSol[3]);
+    const itensAtuais = JSON.parse(valoresSol[5] || "[]");
+    const histParcialAnterior = JSON.parse(valoresSol[6] || "[]");
+    const separacaoIniciadaPor = valoresSol[7] || "";
+    const separacaoIniciadaEm = formatarDataCelula(valoresSol[8] || "");
+    const linhaProducao = valoresSol[9] || "";
+    const urgente = valoresSol[10] || "";
+    const cliente = valoresSol[11] || "";
+    const setor = valoresSol[12] || "LOGISTICA";
+
+    const dataCancelamento = new Date();
+    const dataCancelamentoStr = Utilities.formatDate(dataCancelamento, getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+    const duracao = calcularDuracaoFormatada(dataCriacaoStr, dataCancelamentoStr);
+
+    // Registra o evento de cancelamento na linha do tempo
+    histParcialAnterior.push({
+      dataHora: dataCancelamentoStr,
+      responsavel: responsavel,
+      apenasNota: true,
+      tipoNota: "cancelamentoSolicitacao",
+      motivo: motivo,
+      statusFinal: "CANCELADO",
+      itensPagos: itensAtuais.map(it => ({
+        codigo: it.codigo,
+        op: it.op,
+        qtdPaga: 0,
+        saldoRestante: Number(it.saldoPendente !== undefined ? it.saldoPendente : it.qtd),
+        tipo: it.tipo || "",
+        observacao: `[CANCELADO] Motivo: ${motivo}`
+      }))
+    });
+
+    // Itens gravados no histórico: preserva quem já foi pago e cancela o saldo restante
+    const itensFinalizados = itensAtuais.map(it => {
+      const saldo = Number(it.saldoPendente !== undefined ? it.saldoPendente : it.qtd);
+      if (saldo <= 0 && (it.qtdPagaTotal || 0) > 0) {
+        return it;
+      }
+      return {
+        codigo: it.codigo,
+        qtd: it.qtd,
+        op: it.op,
+        ot: it.ot || "",
+        observacao: `[CANCELADO] Motivo: ${motivo}`,
+        qtdPagaTotal: it.qtdPagaTotal || 0,
+        saldoPendente: saldo,
+        tipo: it.tipo || "",
+        cancelado: true
+      };
+    });
+
+    abaHist.appendRow([
+      id,
+      pcp,
+      logistica,
+      dataCriacaoStr,
+      dataCancelamentoStr,
+      duracao.minutos,
+      duracao.formatado,
+      JSON.stringify(itensFinalizados),
+      JSON.stringify(histParcialAnterior),
+      linhaProducao,
+      urgente,
+      separacaoIniciadaPor,
+      separacaoIniciadaEm,
+      cliente,
+      setor
+    ]);
+
+    abaSol.deleteRow(linhaSol);
+
+    return {
+      sucesso: true,
+      mensagem: `Solicitação Nº ${numeroExibicaoId_(id)} cancelada com sucesso e movida para o Histórico.`
+    };
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Cancela um ou mais itens ESPECÍFICOS de uma solicitação, sem mexer nos
+ * demais — diferente de cancelarSolicitacaoAdm, que cancela tudo e move a
+ * solicitação inteira pro Histórico. Aqui a solicitação CONTINUA na fila de
+ * pendentes se ainda houver saldo em outros itens; se todos os itens ficarem
+ * resolvidos (pagos ou cancelados), ela é automaticamente finalizada e movida pro Histórico.
+ */
+function cancelarItensAdm(dados) {
+  const id = String((dados && dados.id) || "").trim();
+  const motivo = String((dados && dados.motivo) || "").trim();
+  const responsavel = String((dados && dados.responsavel) || "").trim();
+  const setorAtuante = String((dados && dados.setorAtuante) || "").trim();
+  const itensSelecionados = Array.isArray(dados && dados.itens) ? dados.itens : [];
+
+  if (setorAtuante !== "LOGISTICA_ADM") {
+    throw new Error("Apenas assistentes/técnicos (Logística ADM) podem cancelar itens desta solicitação.");
+  }
+  if (!id) throw new Error("ID da solicitação não informado.");
+  if (!motivo) throw new Error("Informe o motivo do cancelamento.");
+  if (!responsavel) throw new Error("Informe o nome do responsável ADM que está cancelando.");
+  if (itensSelecionados.length === 0) throw new Error("Selecione ao menos um item para cancelar.");
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("um cancelamento de itens"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("um cancelamento de itens", responsavel);
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+
+    const dadosSol = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosSol.length; i++) {
+      if (dadosSol[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) {
+      throw new Error("Esta solicitação não foi encontrada — provavelmente já foi finalizada ou cancelada. Atualize a tela.");
+    }
+
+    const valoresSol = abaSol.getRange(linhaSol, 1, 1, 13).getValues()[0];
+    const itensAtuais = JSON.parse(valoresSol[5] || "[]");
+    const histParcialAnterior = JSON.parse(valoresSol[6] || "[]");
+
+    const dataCancelamento = new Date();
+    const dataCancelamentoStr = Utilities.formatDate(dataCancelamento, getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+
+    // Casa cada item selecionado pelo par código+OP (mesma chave usada em
+    // buscarOpDuplicada) — é o identificador mais confiável que já existe
+    // pra distinguir itens dentro da mesma solicitação.
+    const chavesSelecionadas = itensSelecionados.map(it => `${String(it.codigo || "")}|${String(it.op || "")}`);
+    const itensCanceladosAgora = [];
+
+    itensAtuais.forEach(item => {
+      const chave = `${String(item.codigo || "")}|${String(item.op || "")}`;
+      if (chavesSelecionadas.indexOf(chave) === -1 || item.cancelado) return;
+
+      const saldoAnterior = Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd);
+      item.cancelado = true;
+      item.saldoPendente = 0;
+      item.motivoCancelamentoItem = motivo;
+      item.canceladoPor = responsavel;
+      item.canceladoEm = dataCancelamentoStr;
+
+      itensCanceladosAgora.push({
+        codigo: item.codigo,
+        op: item.op,
+        tipo: item.tipo || "",
+        qtdCancelada: saldoAnterior
+      });
+    });
+
+    if (itensCanceladosAgora.length === 0) {
+      throw new Error("Nenhum dos itens selecionados foi encontrado (talvez já tenham sido pagos, cancelados ou a solicitação foi alterada). Atualize a tela e tente de novo.");
+    }
+
+    histParcialAnterior.push({
+      dataHora: dataCancelamentoStr,
+      responsavel: responsavel,
+      apenasNota: true,
+      tipoNota: "cancelamentoItem",
+      motivo: motivo,
+      itensPagos: itensCanceladosAgora.map(it => ({
+        codigo: it.codigo,
+        op: it.op,
+        qtdPaga: 0,
+        saldoRestante: 0,
+        tipo: it.tipo || ""
+      })),
+      itensCancelados: itensCanceladosAgora
+    });
+
+    registrarSugestao_("ADM", responsavel.toUpperCase());
+    registrarSugestao_("RESPONSAVEL", responsavel.toUpperCase());
+
+    const plural = itensCanceladosAgora.length > 1 ? "itens cancelados" : "item cancelado";
+
+    // Verifica se ainda sobrou algum item com saldo pendente
+    const totalPendentesRestantes = itensAtuais.reduce((acc, it) => {
+      if (it.cancelado) return acc;
+      const saldo = Number(it.saldoPendente !== undefined ? it.saldoPendente : it.qtd);
+      return acc + (saldo > 0 ? saldo : 0);
+    }, 0);
+
+    if (totalPendentesRestantes === 0) {
+      // Todos os itens foram atendidos ou cancelados — move automaticamente para o histórico
+      const abaHist = ss.getSheetByName(NOME_ABA_HISTORICO);
+      const pcp = valoresSol[1];
+      const logistica = valoresSol[2];
+      const dataCriacaoStr = formatarDataCelula(valoresSol[3]);
+      const separacaoIniciadaPor = valoresSol[7] || "";
+      const separacaoIniciadaEm = formatarDataCelula(valoresSol[8] || "");
+      const linhaProducao = valoresSol[9] || "";
+      const urgente = valoresSol[10] || "";
+      const cliente = valoresSol[11] || "";
+      const setor = valoresSol[12] || "LOGISTICA";
+      const duracao = calcularDuracaoFormatada(dataCriacaoStr, dataCancelamentoStr);
+
+      abaHist.appendRow([
+        id,
+        pcp,
+        logistica,
+        dataCriacaoStr,
+        dataCancelamentoStr,
+        duracao.minutos,
+        duracao.formatado,
+        JSON.stringify(itensAtuais),
+        JSON.stringify(histParcialAnterior),
+        linhaProducao,
+        urgente,
+        separacaoIniciadaPor,
+        separacaoIniciadaEm,
+        cliente,
+        setor
+      ]);
+
+      abaSol.deleteRow(linhaSol);
+
+      return {
+        sucesso: true,
+        finalizada: true,
+        mensagem: `${itensCanceladosAgora.length} ${plural} com sucesso. Como todos os itens foram concluídos ou cancelados, a solicitação Nº ${numeroExibicaoId_(id)} foi finalizada e movida para o Histórico.`
+      };
+    } else {
+      abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itensAtuais));
+      abaSol.getRange(linhaSol, 7).setValue(JSON.stringify(histParcialAnterior));
+
+      return {
+        sucesso: true,
+        mensagem: `${itensCanceladosAgora.length} ${plural} com sucesso. O restante da solicitação continua na fila normalmente.`
+      };
+    }
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+// Mesma normalização de setor usada em validarPayloadSolicitacao — só pra
+// saber em qual coluna de sugestão (LOGISTICA ou SMT) guardar o nome de quem
+// registrou o item sem requisição.
+function setorAtualOuPadrao_(cabecalho) {
+  return (cabecalho && cabecalho.setor === "SMT") ? "SMT" : "LOGISTICA";
+}
+
+/**
+ * Chamada a partir de carregarDadosSistema_() (mas agora com um limitador de
+ * frequência — no máximo 1 vez a cada 3 minutos, ver executarComLimiteDeFrequencia_
+ * — não mais em toda chamada/25s como antes): procura, em todas as
+ * solicitações ainda pendentes/parciais, itens marcados "Sem requisição"
+ * (semRequisicaoLinha setado — pode ter mais de um rolo/lote) e checa CADA
+ * linha correspondente na planilha do Requisição Manual. Só quando TODAS as
+ * linhas daquele item já tiverem a coluna RESP. BAIXA preenchida, alguém
+ * confirmou a baixa de todos os rolos por lá — então resolve esse item aqui
+ * também (paga o valor cheio), fazendo o item sumir da fila de pendentes
+ * sozinho. É assim que as duas páginas "conversam entre si".
+ */
+/**
+ * Ponto de entrada pra um GATILHO POR TEMPO (Acionadores > Adicionar
+ * acionador > sincronizarBaixasSemRequisicaoAgendada > Baseado em tempo > A
+ * cada 5/10/15 minutos). Diferente de sincronizarBaixasSemRequisicao_(), que
+ * só roda quando alguém tem o app aberto no navegador (a cada 25s de
+ * polling), essa função roda sozinha no servidor, garantindo que a
+ * sincronização aconteça mesmo com o app fechado.
+ */
+function sincronizarBaixasSemRequisicaoAgendada() {
+  iniciarPlanilha();
+  sincronizarBaixasSemRequisicao_();
+}
+
+function sincronizarBaixasSemRequisicao_() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(3000)) return; // não é crítico — tenta de novo no próximo carregamento
+  try {
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosSol = abaSol.getDataRange().getValues();
+
+    const pendentesComLink = [];
+    for (let i = 1; i < dadosSol.length; i++) {
+      if (dadosSol[i][4] !== "PENDENTE" && dadosSol[i][4] !== "PARCIAL") continue;
+      const itens = JSON.parse(dadosSol[i][5] || "[]");
+      itens.forEach(function(it) {
+        const linhas = Array.isArray(it.semRequisicaoLinha)
+          ? it.semRequisicaoLinha
+          : (it.semRequisicaoLinha ? [it.semRequisicaoLinha] : []);
+        if (linhas.length > 0) {
+          pendentesComLink.push({ id: dadosSol[i][0], codigo: it.codigo, qtd: it.qtd, linhas: linhas });
+        }
+      });
+    }
+    if (pendentesComLink.length === 0) return;
+
+    const sheetReqManual = obterSheetRequisicaoManual_();
+    const ultimaLinhaReqManual = sheetReqManual.getLastRow();
+
+    pendentesComLink.forEach(function(pendente) {
+      // Só resolve quando TODOS os rolos/lotes desse item já tiverem sido
+      // baixados lá no Requisição Manual — não faz sentido considerar
+      // "pronto" enquanto só parte dos rolos foi retirada.
+      let todosBaixados = true;
+      let ultimoResponsavel = "";
+      for (const linhaNum of pendente.linhas) {
+        if (linhaNum > ultimaLinhaReqManual) { todosBaixados = false; break; }
+        const linhaValores = sheetReqManual.getRange(linhaNum, 1, 1, 7).getValues()[0];
+        // Confere que a linha ainda é do mesmo código (proteção básica contra
+        // linhas apagadas/movidas manualmente na outra planilha).
+        if (String(linhaValores[0]).trim() !== String(pendente.codigo).trim()) { todosBaixados = false; break; }
+        const respBaixa = String(linhaValores[6] || "").trim(); // coluna G
+        if (!respBaixa) { todosBaixados = false; break; }
+        ultimoResponsavel = respBaixa;
+      }
+      if (!todosBaixados) return;
+
+      try {
+        processarBaixaSeparacao_({
+          id: pendente.id,
+          responsavel: ultimoResponsavel + " (via Requisição Manual)",
+          sincronizacaoAutomatica: true,
+          pagamentos: (function() { const p = {}; p[pendente.codigo] = pendente.qtd; return p; })()
+        });
+      } catch (e) {
+        Logger.log("Falha ao sincronizar baixa sem requisição (código " + pendente.codigo + "): " + (e && e.message ? e.message : e));
+      }
+    });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Processa a separação (baixa total ou parcial) de uma solicitação.
+ * Busca a linha pelo ID (não confia no índice enviado pelo cliente), pois
+ * outra pessoa pode ter finalizado/removido uma linha anterior nesse meio-tempo.
+ */
+/**
+ * Salva (ou corrige) o número da OT de UM item específico de uma
+ * solicitação ainda pendente/parcial — sem precisar confirmar baixa
+ * nenhuma. Pode ser chamada de novo pra editar, caso o usuário tenha
+ * digitado errado.
+ */
+function salvarOtItem(dados) {
+  const id = String((dados && dados.id) || "").trim();
+  const codigo = String((dados && dados.codigo) || "").trim();
+  const ot = String((dados && dados.ot) || "").trim();
+  const observacao = String((dados && dados.observacao) || "").trim();
+  const motivoSobra = String((dados && dados.motivoSobra) || "").trim();
+  const responsavel = String((dados && dados.responsavel) || "").trim();
+  const qtdPretendida = Number((dados && dados.qtd) || 0);
+
+  if (!id) throw new Error("ID da solicitação não informado.");
+  if (!codigo) throw new Error("Código do item não informado.");
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("o registro de uma OT"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("o registro de uma OT", responsavel);
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosAba = abaSol.getDataRange().getValues();
+
+    let linhaSol = -1;
+    for (let i = 1; i < dadosAba.length; i++) {
+      if (dadosAba[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) {
+      throw new Error("Esta solicitação não foi encontrada — provavelmente já foi finalizada. Atualize a tela.");
+    }
+
+    const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+    const item = itens.find(it => it.codigo === codigo);
+    if (!item) {
+      throw new Error(`Item com código ${codigo} não encontrado nesta solicitação.`);
+    }
+
+    const saldoAtual = Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd);
+    let qtdValida = qtdPretendida;
+    if (isNaN(qtdValida) || qtdValida < 0) qtdValida = 0;
+    if (qtdValida > saldoAtual) qtdValida = saldoAtual;
+
+    if (ot && (!qtdValida || qtdValida <= 0)) {
+      throw new Error("Informe a Qtd. Paga (Esta Baixa) antes de gravar a OT. Não é permitido gravar OT com quantidade zerada.");
+    }
+
+    if (ot && qtdValida < saldoAtual && !motivoSobra) {
+      throw new Error("Informe o motivo da sobra / pendência antes de gravar a OT.");
+    }
+
+    // OT e observação são mutuamente exclusivas: se está gravando uma
+    // observação (item sem OT disponível), limpa a OT, e vice-versa.
+    const valorAnteriorOt = item.ot || "";
+    const valorAnteriorObs = item.observacao || "";
+
+    if (observacao) {
+      item.ot = "";
+      item.observacao = observacao;
+    } else {
+      item.ot = ot;
+      item.observacao = "";
+      item.motivoSobra = motivoSobra || (item.motivoSobra || "");
+      // Se esse item tinha sido marcado "Sem requisição" antes e agora
+      // alguém gravou uma OT de verdade por cima, o item está sendo resolvido
+      // por AQUI — então precisa avisar a planilha do Requisição Manual
+      // também, gravando a baixa lá (senão a linha ficaria pendente pra
+      // sempre por lá, mesmo já resolvida aqui). Depois desliga o vínculo,
+      // pro sincronizador parar de olhar pra essas linhas.
+      if (item.semRequisicaoLinha) {
+        marcarBaixaNoRequisicaoManual_(item.semRequisicaoLinha, item.codigo, responsavel);
+        item.semRequisicaoLinha = undefined;
+      }
+    }
+    item.qtdPretendida = qtdValida;
+    item.responsavelRodada = responsavel;
+    item.dataHoraResponsavelRodada = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+    abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itens));
+    registrarSugestao_("RESPONSAVEL", responsavel.toUpperCase());
+
+
+    // Grava uma "nota" permanente no histórico em dois casos: 1) toda vez que
+    // uma observação (sem OT) é salva — já que ela nunca vira uma baixa própria
+    // sozinha, então precisa desse registro pra aparecer na Linha do Tempo; ou
+    // 2) quando uma OT/observação anterior está sendo substituída por outra
+    // coisa sem nenhuma baixa ter sido confirmada nesse meio-tempo.
+    let precisaNota = false;
+    let notaItensPagos = null;
+
+    if (observacao && observacao !== valorAnteriorObs) {
+      precisaNota = true;
+      notaItensPagos = [{ codigo: item.codigo, op: item.op, ot: "", observacao: observacao, qtdPaga: 0, saldoRestante: saldoAtual }];
+    } else if (!observacao && valorAnteriorObs) {
+      precisaNota = true;
+      notaItensPagos = [{ codigo: item.codigo, op: item.op, ot: valorAnteriorOt, observacao: valorAnteriorObs, otNova: ot, qtdPaga: 0, saldoRestante: saldoAtual }];
+    }
+
+    if (precisaNota) {
+      const historicoParcialAtual = JSON.parse(abaSol.getRange(linhaSol, 7).getValue() || "[]");
+      const agoraNota = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+      historicoParcialAtual.push({
+        dataHora: agoraNota,
+        responsavel: responsavel || "-",
+        apenasNota: true,
+        tipoNota: observacao ? "informou" : "substituido",
+        itensPagos: notaItensPagos
+      });
+      abaSol.getRange(linhaSol, 7).setValue(JSON.stringify(historicoParcialAtual));
+    }
+
+    // Marca quem/quando iniciou a separação, só na primeira vez (não sobrescreve depois).
+    const separacaoJaIniciada = abaSol.getRange(linhaSol, 8).getValue();
+    if (!separacaoJaIniciada && responsavel) {
+      const agora = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+      abaSol.getRange(linhaSol, 8, 1, 2).setValues([[responsavel, agora]]);
+    }
+
+    return { sucesso: true };
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Ação única, só pra itens que vieram do fluxo "Sem Requisição": grava a OT
+ * de verdade E já finaliza (baixa) a quantidade total pendente daquele item,
+ * num clique só — sem precisar do passo separado de "Finalizar Separação".
+ * Faz sentido porque a entrega física já aconteceu lá atrás (na hora de
+ * marcar Sem Requisição, com foto+assinatura já capturadas ali) — não tem
+ * nenhuma separação pendente pra fazer depois, só falta anotar a OT de
+ * verdade. Reaproveita a foto/assinatura/nome já salvos no item
+ * (fotoSemRequisicaoUrl/assinaturaSemRequisicaoUrl/liderNomeSemRequisicao) —
+ * não pede nada disso de novo pro segundo usuário.
+ *
+ * @param {Object} dados - { id, codigo, ot, responsavel }
+ */
+function finalizarSemRequisicaoComOt(dados) {
+  const id = String((dados && dados.id) || "").trim();
+  const codigo = String((dados && dados.codigo) || "").trim();
+  const ot = String((dados && dados.ot) || "").trim();
+  const responsavel = String((dados && dados.responsavel) || "").trim();
+
+  if (!id) throw new Error("ID da solicitação não informado.");
+  if (!codigo) throw new Error("Código do item não informado.");
+  if (!ot) throw new Error("Informe o Nº OT antes de finalizar.");
+  if (!responsavel) throw new Error("Informe seu nome antes de finalizar.");
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("a finalização de um item Sem Requisição"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("a finalização de um item Sem Requisição", responsavel);
+
+    const ss = getPlanilha();
+    const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+    const dadosAba = abaSol.getDataRange().getValues();
+    let linhaSol = -1;
+    for (let i = 1; i < dadosAba.length; i++) {
+      if (dadosAba[i][0] === id) { linhaSol = i + 1; break; }
+    }
+    if (linhaSol === -1) {
+      throw new Error("Esta solicitação não foi encontrada — provavelmente já foi finalizada. Atualize a tela.");
+    }
+
+    const itens = JSON.parse(abaSol.getRange(linhaSol, 6).getValue() || "[]");
+    const item = itens.find(it => it.codigo === codigo);
+    if (!item) throw new Error(`Item com código ${codigo} não encontrado nesta solicitação.`);
+
+    if (!item.observacao || item.observacao.indexOf("[SEM REQUISIÇÃO]") !== 0) {
+      throw new Error("Esse item não está classificado como Sem Requisição — grave a OT pelo campo normal.");
+    }
+    if (!item.fotoSemRequisicaoUrl || !item.assinaturaSemRequisicaoUrl || !item.liderNomeSemRequisicao) {
+      throw new Error("Esse item não tem foto/assinatura da entrega salvas — não dá pra finalizar direto. Fale com quem classificou o item como Sem Requisição.");
+    }
+
+    const saldoAtual = Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd);
+    if (!saldoAtual || saldoAtual <= 0) {
+      throw new Error("Esse item não tem saldo pendente pra finalizar.");
+    }
+
+    const fotoUrl = item.fotoSemRequisicaoUrl;
+    const assinaturaUrl = item.assinaturaSemRequisicaoUrl;
+    const liderNome = item.liderNomeSemRequisicao;
+
+    // Grava a OT de verdade por cima da classificação Sem Requisição — mesma
+    // troca que salvarOtItem faz (ot preenchida, observação limpa) — e avisa
+    // o Requisição Manual se essa linha já tinha sido confirmada pelo ADM
+    // (senão ficaria pendente por lá pra sempre, mesmo já resolvida aqui).
+    item.ot = ot;
+    item.observacao = "";
+    item.qtdPretendida = saldoAtual;
+    item.responsavelRodada = responsavel;
+    item.dataHoraResponsavelRodada = Utilities.formatDate(new Date(), getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+    if (item.semRequisicaoLinha) {
+      marcarBaixaNoRequisicaoManual_(item.semRequisicaoLinha, item.codigo, responsavel);
+      item.semRequisicaoLinha = undefined;
+    }
+    abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(itens));
+    registrarSugestao_("RESPONSAVEL", responsavel.toUpperCase());
+
+    const separacaoJaIniciada = abaSol.getRange(linhaSol, 8).getValue();
+    if (!separacaoJaIniciada) {
+      abaSol.getRange(linhaSol, 8, 1, 2).setValues([[responsavel, item.dataHoraResponsavelRodada]]);
+    }
+
+    // Já finaliza (baixa) a quantidade total desse item agora, num clique só —
+    // reaproveitando a foto/assinatura/nome capturados na entrega original, sem
+    // pedir nada disso de novo. Roda dentro do MESMO lock que já seguramos
+    // aqui (por isso chama a versão "_" sem lock próprio).
+    return processarBaixaSeparacao_({
+      id: id,
+      responsavel: responsavel,
+      pagamentos: (function () { const p = {}; p[codigo] = saldoAtual; return p; })(),
+      motivosSobra: {},
+      fotoUrl: fotoUrl,
+      assinaturaUrl: assinaturaUrl,
+      liderNome: liderNome
+    });
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+
+function processarBaixaSeparacao(dadosBaixa) {
+  if (!dadosBaixa || !dadosBaixa.pagamentos || typeof dadosBaixa.pagamentos !== "object") {
+    throw new Error("Dados de baixa inválidos.");
+  }
+  const responsavelBaixa = String(dadosBaixa.responsavel || "").trim();
+  if (!responsavelBaixa) {
+    throw new Error("Informe o responsável pela separação.");
+  }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    throw new Error(mensagemSistemaOcupado_("uma baixa de separação"));
+  }
+
+  try {
+    registrarProcessamentoEmAndamento_("uma baixa de separação", responsavelBaixa);
+    return processarBaixaSeparacao_(dadosBaixa);
+  } finally {
+    limparProcessamentoEmAndamento_();
+    lock.releaseLock();
+  }
+}
+
+// Corpo de processarBaixaSeparacao sem o lock próprio — assim
+// sincronizarBaixasSemRequisicao_() (que já segura seu próprio lock) pode
+// chamar essa mesma lógica direto, sem tentar travar duas vezes.
+function processarBaixaSeparacao_(dadosBaixa) {
+  const responsavelBaixa = String(dadosBaixa.responsavel || "").trim();
+
+  const pagamentosRecebidos = dadosBaixa.pagamentos && typeof dadosBaixa.pagamentos === "object" ? dadosBaixa.pagamentos : {};
+  const motivosSobraRecebidos = dadosBaixa.motivosSobra && typeof dadosBaixa.motivosSobra === "object" ? dadosBaixa.motivosSobra : {};
+  const temPagamentoRealBackend = Object.keys(pagamentosRecebidos).some(cod => Number(pagamentosRecebidos[cod]) > 0);
+
+  const ss = getPlanilha();
+  const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+  const abaHist = ss.getSheetByName(NOME_ABA_HISTORICO);
+
+  registrarSugestao_("RESPONSAVEL", responsavelBaixa);
+
+  // Relê a planilha AGORA (dentro do lock) e localiza a linha pelo ID,
+  // que é a fonte de verdade — nunca pelo índice "linha" enviado pelo cliente.
+  const dados = abaSol.getDataRange().getValues();
+  let linhaSol = -1;
+
+  if (dadosBaixa.id) {
+    for (let i = 1; i < dados.length; i++) {
+      if (dados[i][0] === dadosBaixa.id) { linhaSol = i + 1; break; }
+    }
+  } else if (dadosBaixa.linha) {
+    // Compatibilidade retroativa: confirma que a linha informada ainda corresponde ao ID esperado
+    linhaSol = dadosBaixa.linha;
+  }
+
+  if (linhaSol === -1 || linhaSol > dados.length) {
+    throw new Error("Esta solicitação não foi encontrada — provavelmente já foi finalizada por outra pessoa. Atualize a tela.");
+  }
+
+  const valoresSol = abaSol.getRange(linhaSol, 1, 1, 13).getValues()[0];
+
+  const id = valoresSol[0];
+  const pcp = valoresSol[1];
+  const logistica = valoresSol[2];
+  const dataCriacaoStr = formatarDataCelula(valoresSol[3]);
+  const itensAtuais = JSON.parse(valoresSol[5] || "[]");
+  const histParcialAnterior = JSON.parse(valoresSol[6] || "[]");
+  const linhaProducao = valoresSol[9] || "";
+  const urgente = valoresSol[10] || "";
+  const cliente = valoresSol[11] || "";
+  const setor = valoresSol[12] || "LOGISTICA";
+  const separacaoIniciadaPor = valoresSol[7] || "";
+  const separacaoIniciadaEm = formatarDataCelula(valoresSol[8] || "");
+
+  // Confirmação de entrega (foto + assinatura do líder):
+  // Obrigatória APENAS quando o setor que solicitou foi SMT e houver pagamento real (> 0).
+  // Se for o setor Logística que solicitou (ou sincronização automática via Requisição Manual), não exige foto nem assinatura.
+  const liderNomeBaixa = String(dadosBaixa.liderNome || "").trim();
+  let fotoUrlBaixa = "";
+  let assinaturaUrlBaixa = "";
+  const sSetor = String(setor || "").trim().toUpperCase();
+  const sLogistica = String(logistica || "").toUpperCase();
+  const sCliente = String(cliente || "").trim().toUpperCase();
+  const ehClienteEpson = (sCliente === "EPSON" || sCliente.indexOf("EPSON") !== -1);
+  const ehSetorSmt = (sSetor === "SMT" && sLogistica.indexOf("LOGÍSTICA") === -1 && sLogistica.indexOf("LOGISTICA") === -1 && !ehClienteEpson);
+  const ehSincronizacaoAutomatica = !!dadosBaixa.sincronizacaoAutomatica || responsavelBaixa.indexOf("(via Requisição Manual)") !== -1;
+
+  // dadosBaixa.fotoUrl / dadosBaixa.assinaturaUrl: URLs já prontas, subidas
+  // ANTES desta chamada pelo endpoint uploadarImagemEntregaAntecipada_ (o
+  // front-end sobe em segundo plano assim que a foto é escolhida / a
+  // assinatura é confirmada, enquanto o usuário ainda está preenchendo o
+  // resto do wizard). Quando chegam prontas, pulamos o upload aqui dentro —
+  // é o que faz o clique em "Finalizar Separação" ficar rápido. Se não
+  // vierem (pré-upload falhou ou não rodou), cai no caminho antigo:
+  // recebe a imagem em base64 e sobe agora mesmo, mais lento porém.
+  if (ehSetorSmt && temPagamentoRealBackend && !ehSincronizacaoAutomatica) {
+    if (!dadosBaixa.fotoUrl && !dadosBaixa.fotoBase64) {
+      throw new Error("A foto de referência da entrega é obrigatória para confirmações do setor SMT.");
+    }
+    if (!dadosBaixa.assinaturaUrl && !dadosBaixa.assinaturaBase64) {
+      throw new Error("A assinatura do líder solicitante é obrigatória para confirmações do setor SMT.");
+    }
+    if (!liderNomeBaixa) {
+      throw new Error("Informe o nome do líder solicitante que está assinando.");
+    }
+
+    const idBase = String(id || dadosBaixa.id || "entrega").replace(/[^a-zA-Z0-9\-]/g, "");
+    const carimboBase = Utilities.formatDate(new Date(), getFusoHorario(), "yyyyMMdd-HHmmss");
+    fotoUrlBaixa = dadosBaixa.fotoUrl || salvarImagemBase64NoDrive_(dadosBaixa.fotoBase64, `${idBase}_foto_${carimboBase}`);
+    assinaturaUrlBaixa = dadosBaixa.assinaturaUrl || salvarImagemBase64NoDrive_(dadosBaixa.assinaturaBase64, `${idBase}_assinatura_${carimboBase}`);
+    registrarSugestao_("SMT", liderNomeBaixa);
+  } else if (!ehSetorSmt && (dadosBaixa.fotoUrl || dadosBaixa.fotoBase64 || dadosBaixa.assinaturaUrl || dadosBaixa.assinaturaBase64)) {
+    const idBase = String(id || dadosBaixa.id || "entrega").replace(/[^a-zA-Z0-9\-]/g, "");
+    const carimboBase = Utilities.formatDate(new Date(), getFusoHorario(), "yyyyMMdd-HHmmss");
+    fotoUrlBaixa = dadosBaixa.fotoUrl || (dadosBaixa.fotoBase64 ? salvarImagemBase64NoDrive_(dadosBaixa.fotoBase64, `${idBase}_foto_${carimboBase}`) : "");
+    assinaturaUrlBaixa = dadosBaixa.assinaturaUrl || (dadosBaixa.assinaturaBase64 ? salvarImagemBase64NoDrive_(dadosBaixa.assinaturaBase64, `${idBase}_assinatura_${carimboBase}`) : "");
+    if (liderNomeBaixa) registrarSugestao_("SMT", liderNomeBaixa);
+  }
+
+  const dataBaixa = new Date();
+  const dataBaixaStr = Utilities.formatDate(dataBaixa, getFusoHorario(), "dd/MM/yyyy HH:mm:ss");
+
+  let totalPendentesRestantes = 0;
+  const novosItens = [];
+  const itensComSaldoRestante = [];
+
+  const registroEvento = {
+      dataHora: dataBaixaStr,
+      responsavel: responsavelBaixa,
+      itensPagos: [],
+      fotoUrl: fotoUrlBaixa,
+      assinaturaUrl: assinaturaUrlBaixa,
+      liderNome: liderNomeBaixa
+    };
+
+    const semEstoqueSet = Array.isArray(dadosBaixa.semEstoque) ? dadosBaixa.semEstoque.map(c => String(c)) : [];
+    const setorAtuanteBaixa = String(dadosBaixa.setorAtuante || "").trim();
+    if (semEstoqueSet.length > 0 && setorAtuanteBaixa !== "LOGISTICA_ADM" && setorAtuanteBaixa !== "LOGISTICA") {
+      throw new Error("Só quem está no setor Logística pode classificar um item como Sem Estoque.");
+    }
+    const dadosSolParaEmail = {
+      id: numeroExibicaoId_(id),
+      cliente: cliente,
+      pcp: pcp,
+      logistica: logistica,
+      linhaProducao: linhaProducao,
+      dataHoraRegistro: dataBaixaStr
+    };
+    const avisosEmailEnviados = [];
+
+    for (let i = 0; i < itensAtuais.length; i++) {
+      const item = itensAtuais[i];
+
+      // Se o item já estava cancelado (via cancelarItensAdm), preserva seu estado cancelado
+      if (item.cancelado) {
+        novosItens.push(item);
+        continue;
+      }
+
+      // "Sem estoque" encerra o item na hora, sem pagar nada — o material não
+      // existe pra separar. Não passa pelo cálculo normal de saldo/pagamento.
+      if (semEstoqueSet.includes(String(item.codigo))) {
+        const saldoSemEstoque = Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd);
+        const qtdPagaAnterior = Number(item.qtdPagaTotal || (item.qtd > saldoSemEstoque ? item.qtd - saldoSemEstoque : 0));
+        const observacaoSemEstoque = `[SEM ESTOQUE] Informado por ${responsavelBaixa} em ${dataBaixaStr}`;
+        const dataHoraSemEstoque = item.dataHoraSemEstoque || dataBaixaStr;
+        const responsavelSemEstoque = item.responsavelSemEstoque || responsavelBaixa;
+        registroEvento.itensPagos.push({
+          codigo: item.codigo,
+          op: item.op,
+          ot: item.ot || "",
+          observacao: observacaoSemEstoque,
+          dataHoraSemEstoque: dataHoraSemEstoque,
+          responsavelSemEstoque: responsavelSemEstoque,
+          dataHoraQualidade: item.dataHoraQualidade || "",
+          responsavelQualidade: item.responsavelQualidade || "",
+          qtdPaga: 0,
+          qtdSemEstoque: saldoSemEstoque,
+          qtdPagaAnterior: qtdPagaAnterior,
+          saldoRestante: 0,
+          tipo: item.tipo || ""
+        });
+        novosItens.push({
+          codigo: item.codigo,
+          qtd: item.qtd,
+          op: item.op,
+          ot: item.ot || "",
+          observacao: observacaoSemEstoque,
+          dataHoraSemEstoque: dataHoraSemEstoque,
+          responsavelSemEstoque: responsavelSemEstoque,
+          dataHoraQualidade: item.dataHoraQualidade || "",
+          responsavelQualidade: item.responsavelQualidade || "",
+          qtdPagaTotal: qtdPagaAnterior,
+          qtdSemEstoque: saldoSemEstoque,
+          saldoPendente: 0,
+          tipo: item.tipo || ""
+        });
+        continue;
+      }
+
+      let qtdPagaNestaBaixa = Number(dadosBaixa.pagamentos[item.codigo] || 0);
+      if (isNaN(qtdPagaNestaBaixa) || qtdPagaNestaBaixa < 0) qtdPagaNestaBaixa = 0;
+
+      const saldoAnterior = Number(item.saldoPendente !== undefined ? item.saldoPendente : item.qtd);
+      // Nunca permite pagar mais do que o saldo realmente pendente (evita saldo negativo por payload divergente)
+      if (qtdPagaNestaBaixa > saldoAnterior) qtdPagaNestaBaixa = saldoAnterior;
+
+      let ehSemRequisicaoPagaAqui = false;
+      if (qtdPagaNestaBaixa > 0 && !item.ot) {
+        const ehSemRequisicao = !!(item.observacao && item.observacao.indexOf("[SEM REQUISIÇÃO]") === 0);
+        if (!ehSemRequisicao) {
+          throw new Error(`O item ${item.codigo} está recebendo baixa mas não tem Nº OT gravado. Sem OT de verdade (uma observação sozinha não basta), não é possível confirmar quantidade nenhuma.`);
+        }
+        // Item "Sem requisição" só pode ser finalizado sem OT depois que o ADM
+        // já confirmou e disparou o e-mail pro PCP (é aí que a linha de
+        // verdade entra no Requisição Manual — ver dispararAvisoEquipeAdm).
+        // Sem isso, deixar finalizar aqui criaria um buraco: o item sairia da
+        // fila como resolvido, mas nunca teria existido registro nenhum lá no
+        // Requisição Manual nem aviso pro PCP.
+        if (!item.semRequisicaoLinha || item.semRequisicaoLinha.length === 0) {
+          throw new Error(`O item ${item.codigo} está marcado como Sem Requisição, mas o ADM ainda não confirmou e disparou o e-mail pro PCP — por isso ainda não existe nenhum registro no Requisição Manual. Peça pro ADM clicar em "Confirmar e Enviar E-mail" antes de finalizar esse item.`);
+        }
+        ehSemRequisicaoPagaAqui = true;
+      }
+
+      // Item "Sem requisição" está sendo resolvido AQUI (fluxo normal de
+      // Finalizar Separação, sem esperar o sincronizador) — precisa avisar a
+      // planilha do Requisição Manual também, gravando a baixa lá com o nome
+      // de quem confirmou aqui de verdade (responsavelBaixa), senão a linha
+      // fica pendente pra sempre por lá, e o sincronizador ficaria tentando
+      // reprocessar um item que já foi resolvido.
+      if (ehSemRequisicaoPagaAqui && item.semRequisicaoLinha) {
+        marcarBaixaNoRequisicaoManual_(item.semRequisicaoLinha, item.codigo, responsavelBaixa);
+      }
+
+      const novoSaldo = saldoAnterior - qtdPagaNestaBaixa;
+
+      const motivoSobraItem = String(motivosSobraRecebidos[item.codigo] || "").trim();
+
+      if (qtdPagaNestaBaixa > 0) {
+        registroEvento.itensPagos.push({
+          codigo: item.codigo,
+          op: item.op,
+          ot: item.ot || "",
+          observacao: item.observacao || "",
+          motivoSobra: novoSaldo > 0 ? motivoSobraItem : "",
+          dataHoraQualidade: item.dataHoraQualidade || "",
+          responsavelQualidade: item.responsavelQualidade || "",
+          dataHoraSemEstoque: item.dataHoraSemEstoque || "",
+          responsavelSemEstoque: item.responsavelSemEstoque || "",
+          qtdPaga: qtdPagaNestaBaixa,
+          saldoRestante: novoSaldo > 0 ? novoSaldo : 0,
+          tipo: item.tipo || ""
+        });
+      }
+
+      if (novoSaldo > 0) {
+        totalPendentesRestantes += novoSaldo;
+        if (qtdPagaNestaBaixa > 0) {
+          itensComSaldoRestante.push({ codigo: item.codigo, saldoPendente: novoSaldo });
+        }
+
+        novosItens.push({
+          codigo: item.codigo,
+          qtd: item.qtd,
+          op: item.op,
+          // Se este item recebeu baixa agora e ainda sobrou saldo, limpa a OT,
+          // a quantidade pretendida, a observação e o motivo da sobra anterior,
+          // deixando os campos 100% limpos e prontos para a próxima rodada de separação.
+          ot: qtdPagaNestaBaixa > 0 ? "" : (item.ot || ""),
+          observacao: qtdPagaNestaBaixa > 0 ? "" : (item.observacao || ""),
+          motivoSobra: qtdPagaNestaBaixa > 0 ? "" : (item.motivoSobra || ""),
+          qtdPretendida: qtdPagaNestaBaixa > 0 ? 0 : (item.qtdPretendida || 0),
+          responsavelRodada: qtdPagaNestaBaixa > 0 ? "" : (item.responsavelRodada || ""),
+          dataHoraQualidade: item.dataHoraQualidade || "",
+          responsavelQualidade: item.responsavelQualidade || "",
+          dataHoraSemEstoque: item.dataHoraSemEstoque || "",
+          responsavelSemEstoque: item.responsavelSemEstoque || "",
+          qtdPagaTotal: (item.qtdPagaTotal || 0) + qtdPagaNestaBaixa,
+          saldoPendente: novoSaldo,
+          tipo: item.tipo || ""
+        });
+      } else {
+        novosItens.push({
+          codigo: item.codigo,
+          qtd: item.qtd,
+          op: item.op,
+          ot: item.ot || "",
+          observacao: item.observacao || "",
+          dataHoraQualidade: item.dataHoraQualidade || "",
+          responsavelQualidade: item.responsavelQualidade || "",
+          dataHoraSemEstoque: item.dataHoraSemEstoque || "",
+          responsavelSemEstoque: item.responsavelSemEstoque || "",
+          qtdPagaTotal: item.qtd,
+          saldoPendente: 0,
+          tipo: item.tipo || ""
+        });
+      }
+    }
+
+    if (registroEvento.itensPagos.length > 0) {
+      histParcialAnterior.push(registroEvento);
+    }
+
+    if (totalPendentesRestantes > 0) {
+      abaSol.getRange(linhaSol, 5).setValue("PARCIAL");
+      abaSol.getRange(linhaSol, 6).setValue(JSON.stringify(novosItens));
+      abaSol.getRange(linhaSol, 7).setValue(JSON.stringify(histParcialAnterior));
+      return { status: "PARCIAL", mensagem: "Baixa parcial registrada com sucesso! Ela já aparece no Histórico e o saldo restante continua pendente na fila de separação.", itensComSaldoRestante: itensComSaldoRestante, avisosEmail: avisosEmailEnviados };
+    } else {
+      const duracao = calcularDuracaoFormatada(dataCriacaoStr, dataBaixaStr);
+
+      abaHist.appendRow([
+        id,
+        pcp,
+        logistica,
+        dataCriacaoStr,
+        dataBaixaStr,
+        duracao.minutos,
+        duracao.formatado,
+        JSON.stringify(novosItens),
+        JSON.stringify(histParcialAnterior),
+        linhaProducao,
+        urgente,
+        separacaoIniciadaPor,
+        separacaoIniciadaEm,
+        cliente,
+        setor
+      ]);
+
+      abaSol.deleteRow(linhaSol);
+      return { status: "FINALIZADO", mensagem: "Solicitação 100% separada e movida para o Histórico com sucesso!", avisosEmail: avisosEmailEnviados };
+    }
+}
+
+/**
+ * Calcula a duração entre duas datas (strings "dd/MM/yyyy HH:mm:ss").
+ * Retorna { minutos, formatado }.
+ */
+function calcularDuracaoFormatada(inicioStr, fimStr) {
+  const inicioObj = parseDataBR(inicioStr);
+  const fimObj = parseDataBR(fimStr);
+  const diffMilisegundos = fimObj - inicioObj;
+  const diffMinutos = Math.max(1, Math.round(diffMilisegundos / 1000 / 60));
+
+  const dias = Math.floor(diffMinutos / (60 * 24));
+  const horas = Math.floor((diffMinutos % (60 * 24)) / 60);
+  const minutos = diffMinutos % 60;
+
+  let formatado;
+  if (dias > 0) {
+    formatado = `${dias}d ${horas}h ${minutos}m`;
+  } else if (horas > 0) {
+    formatado = `${horas}h ${minutos}m`;
+  } else {
+    formatado = `${minutos} min`;
+  }
+
+  return { minutos: diffMinutos, formatado: formatado };
+}
+
+/**
+ * Valida o payload de uma nova solicitação. Retorna { ok, erro, dados }.
+ */
+function validarPayloadSolicitacao(dados) {
+  if (!dados || typeof dados !== "object") {
+    return { ok: false, erro: "Payload inválido." };
+  }
+
+  const pcp = String(dados.pcp || "").trim();
+  const logistica = String(dados.logistica || "").trim();
+  const linhaProducao = String(dados.linhaProducao || "").trim().toUpperCase();
+  const urgente = !!dados.urgente;
+  const cliente = String(dados.cliente || "").trim().toUpperCase();
+  // Normaliza pra um dos dois valores válidos — qualquer coisa diferente de
+  // "SMT" cai como "LOGISTICA" (é o padrão histórico, de antes desse campo
+  // existir, então não quebra nada que já estava rodando).
+  const setor = dados.setor === "SMT" ? "SMT" : "LOGISTICA";
+
+  if (!pcp) return { ok: false, erro: "Informe o Requisitante (PCP)." };
+  if (!logistica) return { ok: false, erro: "Informe o Solicitante (Logística)." };
+  if (!linhaProducao) return { ok: false, erro: "Informe a Linha de Produção." };
+  if (!cliente) return { ok: false, erro: "Informe o Cliente." };
+  if (!Array.isArray(dados.itens) || dados.itens.length === 0) {
+    return { ok: false, erro: "Adicione ao menos um item à solicitação." };
+  }
+
+  const itens = [];
+  for (const itemBruto of dados.itens) {
+    const codigo = String(itemBruto.codigo || "").trim();
+    const op = String(itemBruto.op || "").trim().toUpperCase();
+    const qtd = Number(itemBruto.qtd);
+    const tipo = String(itemBruto.tipo || "").trim().toUpperCase();
+
+    if (!codigo) return { ok: false, erro: "Todos os itens precisam de um código PCI." };
+
+    // Aceita um código único de 5 dígitos, ou um pacote com vários códigos de
+    // 5 dígitos separados por "/" (ex: "33546 / 45122 / 15150"). Normaliza o
+    // espaçamento ao redor das barras.
+    const partesCodigo = codigo.split("/").map(p => p.trim()).filter(Boolean);
+    const todosValidos = partesCodigo.length > 0 && partesCodigo.every(p => /^\d{5}$/.test(p));
+    if (!todosValidos) {
+      return { ok: false, erro: `O código PCI "${codigo}" precisa ser um único código de 5 dígitos, ou vários códigos de 5 dígitos separados por "/".` };
+    }
+    const codigoNormalizado = partesCodigo.join(" / ");
+
+    if (!op) return { ok: false, erro: "Todos os itens precisam de um número de OP." };
+    if (!/^\d+$/.test(op)) return { ok: false, erro: `O Nº OP "${op}" deve conter apenas números.` };
+    if (!qtd || isNaN(qtd) || qtd <= 0) return { ok: false, erro: `Quantidade inválida para o código ${codigo}.` };
+    if (!TIPOS_ITEM_VALIDOS.includes(tipo)) {
+      return { ok: false, erro: `Selecione o Tipo (PCI, SMD, Pasta de Solda ou Adesivo) do código ${codigo}.` };
+    }
+
+    // "0000000" (ou qualquer sequência só de zeros) é o placeholder pra "item
+    // sem OP ainda" — só é aceito quando o item é PASTA DE SOLDA ou ADESIVO,
+    // já que esses tipos costumam não ter OP de verdade. PCI e SMD SEMPRE
+    // precisam de um Nº OP de verdade (nunca "0000000" nem qualquer sequência
+    // só de zeros).
+    const opEhPlaceholderLiberado = /^0+$/.test(op) && (tipo === "PASTA DE SOLDA" || tipo === "ADESIVO");
+    if (/^0+$/.test(op) && !opEhPlaceholderLiberado) {
+      return { ok: false, erro: `O Tipo "${tipo}" exige um Nº OP de verdade — "${op}" não é válido (só PASTA DE SOLDA e ADESIVO podem usar OP zerada).` };
+    }
+
+    // Checagem de OP duplicado: só vale pra quem entra pelo setor LOGISTICA
+    // (o único que tem acesso de verdade a criar/fazer baixa) — o SMT fica
+    // livre pra repetir OP, sem essa trava.
+    if (setor === "LOGISTICA" && !opEhPlaceholderLiberado) {
+      const opDuplicado = opJaUtilizado_(op);
+      if (opDuplicado) {
+        return { ok: false, erro: `O Nº OP "${op}" já foi usado na Solicitação Nº ${opDuplicado.id.replace("PCI-", "")}, por ${opDuplicado.logistica}, em ${opDuplicado.data}. Cada OP só pode ser usado em uma solicitação.` };
+      }
+    }
+
+    itens.push({ codigo: codigoNormalizado, op: op, qtd: qtd, tipo: tipo });
+  }
+
+  return { ok: true, dados: { pcp: pcp, logistica: logistica, linhaProducao: linhaProducao, urgente: urgente, cliente: cliente, itens: itens, setor: setor } };
+}
+
+/**
+ * Verifica se um número de OP já foi usado em alguma solicitação — tanto nas
+ * pendentes (aba Solicitacoes_PCI) quanto nas já finalizadas (aba Historico_PCI).
+ * Retorna { id, logistica, data } se encontrar, ou null se o OP estiver livre.
+ */
+function opJaUtilizado_(op) {
+  const ss = getPlanilha();
+
+  const abaSol = ss.getSheetByName(NOME_ABA_SOLICITACOES);
+  if (abaSol && abaSol.getLastRow() > 1) {
+    const dadosSol = abaSol.getRange(2, 1, abaSol.getLastRow() - 1, 6).getValues();
+    for (const linha of dadosSol) {
+      const itens = JSON.parse(linha[5] || "[]");
+      if (itens.some(it => String(it.op || "").toUpperCase() === op)) {
+        return { id: linha[0], logistica: linha[2], data: formatarDataCelula(linha[3]) };
+      }
+    }
+  }
+
+  const abaHist = ss.getSheetByName(NOME_ABA_HISTORICO);
+  if (abaHist && abaHist.getLastRow() > 1) {
+    const dadosHist = abaHist.getRange(2, 1, abaHist.getLastRow() - 1, 8).getValues();
+    for (const linha of dadosHist) {
+      const itens = JSON.parse(linha[7] || "[]");
+      if (itens.some(it => String(it.op || "").toUpperCase() === op)) {
+        return { id: linha[0], logistica: linha[2], data: formatarDataCelula(linha[3]) };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Gera um ID de solicitação com baixa chance de colisão mesmo sob concorrência
+ * (timestamp em milissegundos + 2 dígitos aleatórios).
+ */
+/**
+ * Gera um ID sequencial (PCI-1, PCI-2, PCI-3...). O contador fica salvo nas
+ * Propriedades do Script e só é incrementado dentro do lock de
+ * salvarNovaSolicitacao, então é seguro mesmo com dois envios simultâneos.
+ * Na primeira vez que roda, calcula o próximo número olhando o maior ID já
+ * existente nas duas abas, pra não colidir com solicitações antigas.
+ */
+function gerarIdSolicitacao() {
+  const props = PropertiesService.getScriptProperties();
+  let ultimo = Number(props.getProperty("ULTIMO_ID_PCI"));
+
+  if (!ultimo || isNaN(ultimo)) {
+    ultimo = descobrirMaiorIdExistente();
+  }
+
+  const novoId = ultimo + 1;
+  props.setProperty("ULTIMO_ID_PCI", String(novoId));
+  return "PCI-" + novoId;
+}
+
+/**
+ * Usado só na primeira execução (quando ainda não existe o contador salvo):
+ * varre as duas abas e acha o maior número de ID já usado, pra continuar a
+ * sequência a partir dali em vez de reiniciar do 1 e arriscar duplicar.
+ */
+function descobrirMaiorIdExistente() {
+  const ss = getPlanilha();
+  let maior = 0;
+
+  [NOME_ABA_SOLICITACOES, NOME_ABA_HISTORICO].forEach(nomeAba => {
+    const aba = ss.getSheetByName(nomeAba);
+    if (!aba || aba.getLastRow() < 2) return; // só tem cabeçalho, nada a varrer
+    const ids = aba.getRange(2, 1, aba.getLastRow() - 1, 1).getValues();
+    ids.forEach(linha => {
+      const match = String(linha[0] || "").match(/(\d+)\s*$/);
+      if (match) {
+        const num = Number(match[1]);
+        if (num > maior && num < 1000000) maior = num; // ignora IDs antigos no formato timestamp (muito grandes)
+      }
+    });
+  });
+
+  return maior;
+}
+
+/**
+ * Função auxiliar para converter string de data PT-BR em objeto Date
+ */
+function parseDataBR(dataStr) {
+  try {
+    const partes = dataStr.split(" ");
+    const dataPartes = partes[0].split("/");
+    const horaPartes = partes[1] ? partes[1].split(":") : [0, 0, 0];
+    return new Date(dataPartes[2], dataPartes[1] - 1, dataPartes[0], horaPartes[0], horaPartes[1], horaPartes[2] || 0);
+  } catch (e) {
+    return new Date(); // Fallback se o formato falhar
+  }
+}
